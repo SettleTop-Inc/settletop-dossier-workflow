@@ -81,19 +81,19 @@ on:
       licence-url:
         description: SettleTop licence service endpoint that exchanges the identity token for a licence.
         type: string
-        default: https://licence.settletop.invalid/v1/licence # TODO(infra)
+        default: https://registry.settletop.com/api/github/licence
       licence-audience:
         description: Fixed `aud` of the identity token sent to the licence service.
         type: string
-        default: https://licence.settletop.invalid # TODO(infra)
+        default: https://licence.settletop.com
       registry-ingest-url:
         description: Registry ingest endpoint (POST /api/ingest/scan). Used when share == registry.
         type: string
-        default: https://registry.settletop.invalid/api/ingest/scan # TODO(infra)
+        default: https://registry.settletop.com/api/ingest/scan
       registry-audience:
         description: Fixed `aud` of the identity token sent to the registry ingest.
         type: string
-        default: https://ingest.settletop.invalid # TODO(infra)
+        default: https://ingest.settletop.com
     outputs:
       shared:
         description: "true if the share view was uploaded to the registry."
