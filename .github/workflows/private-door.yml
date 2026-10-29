@@ -557,7 +557,8 @@ jobs:
           set -euo pipefail
           # The registry binds the owner from the OIDC token, not from this payload (it ignores
           # any account/owner field), and cross-checks subject against the token's claims.
-          # TODO(infra): confirm the subject field names against the registry's ingest_scan schema.
+          # ingest_code_check reads subject.repo ("owner/name") and subject.commit; the route
+          # fills repository_owner_id and forge_repo_id from the OIDC token.
           python3 -I - <<'PY'
           import json, os
           e = os.environ
@@ -566,8 +567,8 @@ jobs:
               "subject": {
                   "forge": "github",
                   "repository_id": int(e["REPOSITORY_ID"]),
-                  "repository": e["REPOSITORY"],
-                  "commit_sha": e["COMMIT_SHA"],
+                  "repo": e["REPOSITORY"],
+                  "commit": e["COMMIT_SHA"],
                   "ref": e["REF"],
                   "run_id": int(e["RUN_ID"]),
                   "run_attempt": int(e["RUN_ATTEMPT"]),
