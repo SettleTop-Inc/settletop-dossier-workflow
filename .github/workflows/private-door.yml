@@ -1,0 +1,634 @@
+# =============================================================================
+# Private door: the reusable workflow (spec section 4.2, #157; registry POST #163).
+#
+# DESTINATION. This file is DRAFTED here for review and handoff. It is destined
+# for SettleTop's separate PUBLIC, workflow-only repo, so that customers in other
+# orgs can call it and so the signer identity (`job_workflow_ref`) is one stable,
+# public workflow. This repo is private. Moving it is an infra/deployment step.
+# It cannot run end to end until infra supplies a runner, the engine image, the
+# licence service and the registry ingest. Every infra-owned value is a workflow
+# input with a placeholder default, or marked `# TODO(infra):`.
+#
+# HOW A COMPANY CALLS IT (the one short file it writes and controls):
+#
+#   on: { push: { branches: [main] }, release: { types: [created] }, schedule: [{ cron: "0 6 * * 1" }], workflow_dispatch: {} }
+#   jobs:
+#     dossier:
+#       # TODO(infra): replace with the published workflow repo + a pinned tag or SHA.
+#       uses: SettleTop-Inc/TODO-infra-workflow-repo/.github/workflows/private-door.yml@TODO-infra-ref
+#       permissions:              # the caller must grant the UNION of what the jobs below ask for;
+#         id-token: write         #   licence + share (each job then gets only its own slice)
+#         contents: write         #   keep-release only; check and the rest stay at read
+#         checks: write           #   keep-checks
+#         security-events: write  #   keep-security-tab
+#         actions: write          #   cleanup (spec 4.2: the caller's own token, never the App)
+#       with:
+#         keep: summary,artifact  # summary,checks,artifact,security-tab,release,none
+#         share: registry         # or none (default)
+#
+# JOBS (spec 4.2): [fork guard] -> licence -> check -> keep* / share -> cleanup.
+#   licence  id-token: write only. Trades GitHub's identity token for a short-lived licence.
+#   check    contents: read only, NO identity token. Sandboxed engine, no network.
+#   keep*    one job per output, each with only the permission that output needs.
+#   share    id-token: write only. Validates the report, POSTs the share view to the registry.
+#   cleanup  actions: write only, if: always(). Deletes the licence + report transfer artifacts.
+#
+# Reusable workflows cannot vary a job's permissions at run time, so the spec's single
+# "keep" job is one job per output here. A skipped job still counts toward the caller's
+# permission ceiling (above). An alternative is one reusable workflow file per keep output.
+#
+# WHAT LEAVES THE RUNNER (spec 4.3): only the share view, and only with `share: registry`.
+# The licence job contacts SettleTop on EVERY run (it sends GitHub's identity token), even
+# when nothing is shared. No source, snippets, secret values or secret locations are sent.
+# =============================================================================
+name: Dossier scan (private door)
+
+on:
+  workflow_call:
+    inputs:
+      keep:
+        description: >-
+          Comma-separated list of where the company keeps results (spec 4.2.1):
+          summary, checks, artifact, security-tab, release, none. `none` stands alone and
+          leaves only a one-line job summary. (`bucket` is not implemented yet.)
+        type: string
+        default: summary,artifact
+      keep-retention-days:
+        description: Retention for the `artifact` keep option, in days. 0 uses the repo/org default.
+        type: number
+        default: 0
+      share:
+        description: "'registry' to upload the share view to the registry, 'none' to skip (default)."
+        type: string
+        default: none
+      max-share-bytes:
+        description: Size cap for the share view. Over it the report is "truncated" (spec 9.1) and not uploaded.
+        type: number
+        default: 5242880 # TODO(infra): 5 MiB placeholder. Set the real cap (spec 9.1).
+      engine-image:
+        description: The licence-gated engine image, pinned by digest (name@sha256:<64 hex>).
+        type: string
+        # TODO(infra): the published GHCR image digest. The all-zero digest is refused at run time.
+        default: ghcr.io/settletop-inc/dossier-engine@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      engine-commit:
+        description: The engine's source commit, recorded in run_meta. Empty records "Unknown".
+        type: string
+        default: "" # TODO(infra): better baked into the image than passed here.
+      engine-memory:
+        description: Memory limit for the engine container (docker --memory). Swap is disabled.
+        type: string
+        default: 4g
+      licence-url:
+        description: SettleTop licence service endpoint that exchanges the identity token for a licence.
+        type: string
+        default: https://licence.settletop.invalid/v1/licence # TODO(infra)
+      licence-audience:
+        description: Fixed `aud` of the identity token sent to the licence service.
+        type: string
+        default: https://licence.settletop.invalid # TODO(infra)
+      registry-ingest-url:
+        description: Registry ingest endpoint (POST /api/ingest/scan). Used when share == registry.
+        type: string
+        default: https://registry.settletop.invalid/api/ingest/scan # TODO(infra)
+      registry-audience:
+        description: Fixed `aud` of the identity token sent to the registry ingest.
+        type: string
+        default: https://ingest.settletop.invalid # TODO(infra)
+    outputs:
+      shared:
+        description: "true if the share view was uploaded to the registry."
+        value: ${{ jobs.share.outputs.shared }}
+      share-sha256:
+        description: sha256 of the share block (spec 9.2), when shared.
+        value: ${{ jobs.share.outputs.share-sha256 }}
+
+# Deny by default; every job states exactly what it needs.
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # licence. Fork guard: forks skip this job, so nothing downstream runs and no
+  # licence is requested (spec 4.2). PRs from forks are skipped too (no identity token).
+  # ---------------------------------------------------------------------------
+  licence:
+    if: github.event.repository.fork != true && github.event.pull_request.head.repo.fork != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      id-token: write # the only permission (spec 4.2)
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Preflight (inputs are configured and safe)
+        env:
+          ENGINE_IMAGE: ${{ inputs.engine-image }}
+          LICENCE_URL: ${{ inputs.licence-url }}
+          LICENCE_AUDIENCE: ${{ inputs.licence-audience }}
+          SHARE: ${{ inputs.share }}
+          INGEST_URL: ${{ inputs.registry-ingest-url }}
+          REGISTRY_AUDIENCE: ${{ inputs.registry-audience }}
+          KEEP: ${{ inputs.keep }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          need_url() {
+            [[ "$2" =~ ^https://[^/[:space:]]+(/.*)?$ ]] || fail "$1 must be an https URL"
+            if [[ "$2" =~ ^https://[^/]*\.invalid(/|$) ]]; then fail "$1 is still the placeholder (TODO(infra))"; fi
+          }
+          [[ "$ENGINE_IMAGE" =~ ^[a-z0-9][a-z0-9./_-]*@sha256:[0-9a-f]{64}$ ]] || fail "engine-image must be pinned by digest (name@sha256:<64 hex>)"
+          if [[ "$ENGINE_IMAGE" =~ @sha256:0{64}$ ]]; then fail "engine-image is still the placeholder digest (TODO(infra))"; fi
+          need_url licence-url "$LICENCE_URL"
+          need_url licence-audience "$LICENCE_AUDIENCE"
+          case "$SHARE" in
+            none) ;;
+            registry) need_url registry-ingest-url "$INGEST_URL"; need_url registry-audience "$REGISTRY_AUDIENCE" ;;
+            *) fail "share must be 'none' or 'registry'" ;;
+          esac
+          [ -n "$KEEP" ] || fail "keep must not be empty (use 'none')"
+          IFS=, read -ra opts <<< "$KEEP"
+          for o in "${opts[@]}"; do
+            case "$o" in
+              summary|checks|artifact|security-tab|release) ;;
+              none) [ "${#opts[@]}" -eq 1 ] || fail "keep: none cannot be combined with other options" ;;
+              bucket) fail "keep: bucket is not implemented yet (TODO(infra): needs the provider + cloud identity design)" ;;
+              *) fail "unknown keep option '$o'" ;;
+            esac
+          done
+
+      - name: Exchange the identity token for a licence
+        env:
+          LICENCE_URL: ${{ inputs.licence-url }}
+          LICENCE_AUDIENCE: ${{ inputs.licence-audience }}
+        run: |
+          set -euo pipefail
+          umask 077
+          dir="$RUNNER_TEMP/licence"; mkdir -p "$dir"
+          # 1. GitHub identity token for the fixed audience. Masked before it is used anywhere.
+          oidc=$(curl -fsS --get --data-urlencode "audience=$LICENCE_AUDIENCE" \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" |
+            python3 -I -c 'import json,sys; print(json.load(sys.stdin)["value"])')
+          echo "::add-mask::$oidc"
+          # 2. Trade it for the licence. The bearer goes through curl's stdin config, not argv.
+          # TODO(infra): contract assumed here: POST {} + Bearer <oidc>  ->  200 {"licence": "<Ed25519 token>"}.
+          # The service derives repository_id and run_id from the token's claims (spec 5.1).
+          printf 'header = "Authorization: Bearer %s"\n' "$oidc" | curl -K - -fsS --proto '=https' \
+            --max-time 30 --retry 2 -X POST -H 'Content-Type: application/json' -d '{}' \
+            -o "$dir/response.json" "$LICENCE_URL"
+          python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["licence"], end="")' \
+            "$dir/response.json" > "$dir/licence.txt"
+          rm -f "$dir/response.json"
+          [ -s "$dir/licence.txt" ] || { echo "::error::the licence service returned no licence"; exit 1; }
+          echo "::add-mask::$(cat "$dir/licence.txt")"
+
+      # The licence is bound to this repository id and run id and expires within minutes.
+      # The artifact lives one day at most, and `cleanup` deletes it by id.
+      - name: Pass the licence on (1-day artifact)
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dossier-licence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/licence/licence.txt
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Remove the local licence copy
+        if: always()
+        run: rm -f "$RUNNER_TEMP/licence/licence.txt" "$RUNNER_TEMP/licence/response.json"
+
+  # ---------------------------------------------------------------------------
+  # check. contents: read only, NO identity token. The engine runs in a sandbox
+  # with no network and reads files from the git tree object (the engine lists the
+  # tree and reads blobs; it never walks the working tree).
+  # ---------------------------------------------------------------------------
+  check:
+    needs: licence
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read # the only permission (spec 4.2)
+    outputs:
+      report-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      share-file-sha256: ${{ steps.engine.outputs.share-file-sha256 }}
+      share-file-bytes: ${{ steps.engine.outputs.share-file-bytes }}
+      commit-sha: ${{ steps.engine.outputs.commit-sha }}
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false # the token must not sit in .git/config
+
+      - name: Fetch the licence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.licence.outputs.artifact-id }}
+          path: ${{ runner.temp }}/licence
+          merge-multiple: true
+
+      - name: Run the engine in a sandbox
+        id: engine
+        env:
+          ENGINE_IMAGE: ${{ inputs.engine-image }}
+          ENGINE_COMMIT: ${{ inputs.engine-commit }}
+          ENGINE_MEMORY: ${{ inputs.engine-memory }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          licence="$RUNNER_TEMP/licence/licence.txt"
+          out="$RUNNER_TEMP/out"; mkdir -p "$out"
+          log="$RUNNER_TEMP/engine.log" # engine output stays on this runner, never in the live log
+          repo_name="${REPOSITORY#*/}"  # the engine names the subject after the directory
+          commit=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)
+          extra=(); [ -z "$ENGINE_COMMIT" ] || extra=(--engine-commit "$ENGINE_COMMIT")
+
+          # TODO(infra): if the image is private, log in to GHCR here. The image is licence-gated, not secret.
+          docker pull --quiet "$ENGINE_IMAGE" > /dev/null
+
+          # Sandbox (spec 4.2): no network, non-root (the runner user, so git trusts the mount),
+          # read-only root, no-new-privileges, tmpfs /tmp, all capabilities dropped, memory + pid limits.
+          # The licence goes in on stdin (--require-licence reads it there). Repo mounted read-only.
+          # TODO(infra): the engine shells out to `git` (fetch.rs), so the "distroless" image must carry git.
+          set +e
+          docker run --rm -i \
+            --network none \
+            --user "$(id -u):$(id -g)" \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --memory "$ENGINE_MEMORY" --memory-swap "$ENGINE_MEMORY" \
+            --pids-limit 256 \
+            -e HOME=/tmp -e GIT_CONFIG_NOSYSTEM=1 \
+            -v "$GITHUB_WORKSPACE:/work/$repo_name:ro" \
+            -v "$out:/out" \
+            "$ENGINE_IMAGE" \
+            scan --path "/work/$repo_name" --commit "$commit" \
+              --require-licence --repository-id "$REPOSITORY_ID" --run-id "$RUN_ID" \
+              --share-out /out/share.json \
+              --bom-out /out/bom.cdx.json \
+              --sarif-out /out/results.sarif \
+              --findings-out /out/findings.json \
+              --html-out /out/summary.html \
+              "${extra[@]}" \
+            < "$licence" > "$log" 2>&1
+          status=$?
+          set -e
+          rm -f "$licence"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::the engine exited with status $status (its log stays on the runner and is not printed)"
+            exit 1
+          fi
+          for f in share.json bom.cdx.json results.sarif findings.json summary.html; do
+            [ -s "$out/$f" ] || { echo "::error::the engine did not write $f"; exit 1; }
+          done
+          {
+            echo "share-file-sha256=$(sha256sum "$out/share.json" | cut -d' ' -f1)"
+            echo "share-file-bytes=$(wc -c < "$out/share.json" | tr -d ' ')"
+            echo "commit-sha=$commit"
+          } >> "$GITHUB_OUTPUT"
+
+      # The only copy the workflow makes beyond `keep`. `cleanup` deletes it by id.
+      - name: Pass the report on (1-day artifact)
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dossier-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/out
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # keep (spec 4.2.1). Always the caller's own token, never the App. One job per
+  # output so each holds only the permission that output needs.
+  # ---------------------------------------------------------------------------
+  keep:
+    # summary + artifact need no token permission.
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Fetch the report
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.check.outputs.report-artifact-id }}
+          path: report
+          merge-multiple: true
+
+      - name: Job summary
+        env:
+          KEEP: ${{ inputs.keep }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import json, os
+          env = json.load(open("report/share.json", encoding="utf-8"))
+          share = env["share"]
+          out = []
+          if "summary" not in os.environ["KEEP"].split(","):
+              # keep: none (spec 4.2.1): one line, outcome and report_sha256.
+              # TODO(infra): the engine emits no `outcome` or `coverage` yet (spec 9.1), so this says
+              # only that the engine run finished (it exited 0). Show both once they exist.
+              out.append(f"Dossier scan finished. report_sha256 `{share['report_sha256']}`")
+          else:
+              out.append("## SettleTop AI dossier")
+              out.append(f"Engine run finished at commit `{share['subject']['commit']}`. No source text is shown here.")
+              out.append(f"- report_sha256 `{share['report_sha256']}`")
+              out.append(f"- share_sha256 `{env['share_sha256']}`")
+              out.append("")
+              out.append("| Section | State | Count |")
+              out.append("|---|---|---|")
+              for name in sorted(share):
+                  sec = share[name]
+                  if isinstance(sec, dict) and "state" in sec:
+                      # Unknown is never shown as 0 (spec 4.2.1).
+                      n = len(sec.get("items", [])) if sec["state"] == "checked" else "Unknown"
+                      out.append(f"| {name} | {sec['state']} | {n} |")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("\n".join(out) + "\n")
+          PY
+
+      - name: Keep as a workflow artifact
+        if: contains(format(',{0},', inputs.keep), ',artifact,')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          # Separately named from the transfer artifacts, so `cleanup` leaves it alone.
+          # Holds: full report JSON (findings.json), SARIF, BOM, share view, HTML summary.
+          # TODO(infra): the code BOM rendered from the share view (spec 4.2.1) has no engine flag yet.
+          name: dossier-kept-${{ github.run_id }}-${{ github.run_attempt }}
+          path: report/
+          retention-days: ${{ inputs.keep-retention-days }}
+          if-no-files-found: error
+
+  keep-checks:
+    if: contains(format(',{0},', inputs.keep), ',checks,')
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      checks: write
+    steps:
+      - name: Fetch the report
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.check.outputs.report-artifact-id }}
+          path: report
+          merge-multiple: true
+
+      - name: Write a check run with annotations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          # On a PR, annotate the PR head so the check shows on the pull request.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || needs.check.outputs.commit-sha }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import json, os
+          sarif = json.load(open("report/results.sarif", encoding="utf-8"))
+          results = [r for run in sarif.get("runs", []) for r in run.get("results", [])]
+          level = {"error": "failure", "warning": "warning", "note": "notice"}
+          ann = []
+          for r in results[:50]:  # the API takes at most 50 annotations per request
+              loc = (r.get("locations") or [{}])[0].get("physicalLocation", {})
+              path = loc.get("artifactLocation", {}).get("uri")
+              if not path:
+                  continue
+              line = loc.get("region", {}).get("startLine", 1)
+              ann.append({
+                  "path": path, "start_line": line, "end_line": line,
+                  "annotation_level": level.get(r.get("level", "warning"), "warning"),
+                  "title": str(r.get("ruleId", "finding"))[:255],
+                  "message": r.get("message", {}).get("text", "")[:60000],
+              })
+          payload = {
+              "name": "SettleTop AI dossier",
+              "head_sha": os.environ["HEAD_SHA"],
+              "status": "completed",
+              # Informational. Gating is the engine's --fail-on (not in this CLI yet).
+              "conclusion": "neutral",
+              "output": {
+                  "title": f"{len(results)} finding(s)",
+                  "summary": f"{len(results)} finding(s), {len(ann)} annotated. Blind spots are in the SARIF toolExecutionNotifications.",
+                  "annotations": ann,
+              },
+          }
+          json.dump(payload, open("check-run.json", "w", encoding="utf-8"))
+          PY
+          curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            -d @check-run.json "$GITHUB_API_URL/repos/$REPOSITORY/check-runs" > /dev/null
+
+  keep-security-tab:
+    if: contains(format(',{0},', inputs.keep), ',security-tab,')
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      security-events: write
+      contents: read # private repos: upload-sarif reads these
+      actions: read
+    steps:
+      - name: Fetch the report
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.check.outputs.report-artifact-id }}
+          path: report
+          merge-multiple: true
+      # Private repos need GitHub Code Security for this to be accepted.
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: report/results.sarif
+          category: settletop-dossier
+
+  keep-release:
+    if: contains(format(',{0},', inputs.keep), ',release,')
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Fetch the report
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.check.outputs.report-artifact-id }}
+          path: report
+          merge-multiple: true
+      # Only works while the release is still a draft/unpublished: with immutable releases
+      # nothing can be attached after publishing (spec 4.2.1). Needs `gh` (on GitHub-hosted runners).
+      - name: Attach the report to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          [ "$EVENT_NAME" = release ] || { echo "::error::keep: release needs a release event"; exit 1; }
+          tar -czf dossier-report.tar.gz -C report .
+          gh release upload "$TAG" dossier-report.tar.gz --repo "$REPOSITORY" --clobber
+
+  # ---------------------------------------------------------------------------
+  # share (spec 4.2.2). id-token: write only. Validates the report, then POSTs the
+  # settletop.dossier-scan/2 envelope to the registry ingest, authenticated by a
+  # GitHub OIDC token with a fixed audience (the registry pins aud, the numeric
+  # repository_id / repository_owner_id and job_workflow_ref server-side).
+  # Only the share view leaves: findings.json (with locations) is never read here.
+  # ---------------------------------------------------------------------------
+  share:
+    if: inputs.share == 'registry'
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write # the only permission (spec 4.2)
+    outputs:
+      shared: ${{ steps.post.outputs.shared }}
+      share-sha256: ${{ steps.validate.outputs.share-sha256 }}
+    steps:
+      - name: Download the report by artifact id
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.check.outputs.report-artifact-id }}
+          path: report
+          merge-multiple: true
+
+      - name: Validate digest, size and schema
+        id: validate
+        env:
+          ENGINE_IMAGE: ${{ inputs.engine-image }}
+          MAX_BYTES: ${{ inputs.max-share-bytes }}
+          EXPECT_SHA256: ${{ needs.check.outputs.share-file-sha256 }}
+          EXPECT_BYTES: ${{ needs.check.outputs.share-file-bytes }}
+        run: |
+          set -euo pipefail
+          # 1. The file is the one `check` wrote (digest + size), under the cap, and the share
+          #    block hashes to its own share_sha256 (compact, sorted-key JSON: the byte form the
+          #    engine hashes, spec 9.2).
+          python3 -I - <<'PY'
+          import hashlib, json, os, sys
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+          raw = open("report/share.json", "rb").read()
+          if len(raw) > int(os.environ["MAX_BYTES"]):
+              fail("share view is over the size cap (outcome: truncated); not uploaded")
+          if len(raw) != int(os.environ["EXPECT_BYTES"]) or hashlib.sha256(raw).hexdigest() != os.environ["EXPECT_SHA256"]:
+              fail("share view does not match the digest or size recorded by check")
+          env = json.loads(raw)
+          share = env.get("share")
+          if not isinstance(share, dict) or "share_sha256" not in env:
+              fail("share view is not a share-view envelope")
+          if share.get("schema") != "settletop.agent-background-check/1":
+              fail("unexpected share view schema")
+          canon = json.dumps(share, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+          if hashlib.sha256(canon).hexdigest() != env["share_sha256"]:
+              fail("share_sha256 does not match the share block")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"share-sha256={env['share_sha256']}\n")
+          PY
+          # 2. The engine's own check: JSON Schema + SEC re-scan (`validate`), in the same
+          #    sandbox, so a secret-shaped string anywhere in the envelope blocks the upload.
+          docker pull --quiet "$ENGINE_IMAGE" > /dev/null
+          log="$RUNNER_TEMP/validate.log" # may name rule ids and JSON pointers; kept off the live log
+          if ! docker run --rm --network none --user "$(id -u):$(id -g)" --read-only \
+              --tmpfs /tmp:rw,noexec,nosuid,size=64m --cap-drop ALL --security-opt no-new-privileges \
+              --memory 512m --memory-swap 512m --pids-limit 64 \
+              -v "$PWD/report:/in:ro" "$ENGINE_IMAGE" validate --share /in/share.json > "$log" 2>&1; then
+            echo "::error::the engine rejected the share view ($(grep -c . "$log") line(s) on the runner; not printed). Nothing was uploaded."
+            exit 1
+          fi
+
+      - name: Build the settletop.dossier-scan/2 envelope
+        env:
+          REPOSITORY_ID: ${{ github.repository_id }}
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          COMMIT_SHA: ${{ needs.check.outputs.commit-sha }}
+        run: |
+          set -euo pipefail
+          # The registry binds the owner from the OIDC token, not from this payload (it ignores
+          # any account/owner field), and cross-checks subject against the token's claims.
+          # TODO(infra): confirm the subject field names against the registry's ingest_scan schema.
+          python3 -I - <<'PY'
+          import json, os
+          e = os.environ
+          envelope = {
+              "schema": "settletop.dossier-scan/2",
+              "subject": {
+                  "forge": "github",
+                  "repository_id": int(e["REPOSITORY_ID"]),
+                  "repository": e["REPOSITORY"],
+                  "commit_sha": e["COMMIT_SHA"],
+                  "ref": e["REF"],
+                  "run_id": int(e["RUN_ID"]),
+                  "run_attempt": int(e["RUN_ATTEMPT"]),
+              },
+              # The engine envelope: share view + share_sha256 + advisories + run_meta.
+              "report": json.load(open("report/share.json", encoding="utf-8")),
+          }
+          with open("envelope.json", "w", encoding="utf-8") as f:
+              json.dump(envelope, f, separators=(",", ":"), ensure_ascii=False)
+          PY
+
+      - name: Upload to the registry (OIDC bearer)
+        id: post
+        env:
+          INGEST_URL: ${{ inputs.registry-ingest-url }}
+          REGISTRY_AUDIENCE: ${{ inputs.registry-audience }}
+          IDEMPOTENCY_KEY: ${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          oidc=$(curl -fsS --get --data-urlencode "audience=$REGISTRY_AUDIENCE" \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" |
+            python3 -I -c 'import json,sys; print(json.load(sys.stdin)["value"])')
+          echo "::add-mask::$oidc"
+          # The bearer goes through curl's stdin config, not argv. Not --fail, so the body can be shown.
+          # TODO(infra): confirm the registry honours Idempotency-Key (a retried run must not double-ingest).
+          status=$(printf 'header = "Authorization: Bearer %s"\n' "$oidc" | curl -K - -sS --proto '=https' \
+            --tlsv1.2 --max-time 120 --retry 2 -X POST \
+            -H 'Content-Type: application/json' -H "Idempotency-Key: $IDEMPOTENCY_KEY" \
+            --data-binary @envelope.json -o response.json -w '%{http_code}' "$INGEST_URL")
+          if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
+            echo "::error::registry ingest returned HTTP $status: $(head -c 1000 response.json | tr -d '\r\n')"
+            exit 1
+          fi
+          echo "shared=true" >> "$GITHUB_OUTPUT"
+          echo "Shared the share view (HTTP $status)." >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # cleanup (spec 4.2). actions: write only, granted in the caller to its own token.
+  # Runs last, even on failure or cancel. Deletes the licence + report transfer
+  # artifacts by id and uploads nothing. If it never starts, retention-days: 1 removes
+  # them within a day. The `keep: artifact` bundle has another name and is left alone.
+  # ---------------------------------------------------------------------------
+  cleanup:
+    if: always() && needs.licence.result != 'skipped'
+    needs: [licence, check, keep, keep-checks, keep-security-tab, keep-release, share]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Delete the transfer artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          # An id is empty when its job never got as far as uploading.
+          IDS: ${{ needs.licence.outputs.artifact-id }} ${{ needs.check.outputs.report-artifact-id }}
+        run: |
+          set -uo pipefail
+          for id in $IDS; do
+            [[ "$id" =~ ^[0-9]+$ ]] || continue
+            curl -fsS -X DELETE -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$REPOSITORY/actions/artifacts/$id" > /dev/null ||
+              echo "::warning::could not delete artifact $id; retention-days: 1 removes it within a day"
+          done
