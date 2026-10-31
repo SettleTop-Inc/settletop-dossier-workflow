@@ -69,7 +69,7 @@ on:
         description: The licence-gated engine image, pinned by digest (name@sha256:<64 hex>).
         type: string
         # Published GHCR image, pinned by digest (re-pin when the engine image is rebuilt).
-        default: ghcr.io/settletop-inc/dossier-engine@sha256:9af03860ef024889ff7827d38b3a5d86b4e4123f0690691062958b62f4aa9378
+        default: ghcr.io/settletop-inc/dossier-engine@sha256:7f40f881df5881769b99e2b9f0b5377f52c989760d36611c6f1ef156c5ba718f
       engine-commit:
         description: The engine's source commit, recorded in run_meta. Empty records "Unknown".
         type: string
