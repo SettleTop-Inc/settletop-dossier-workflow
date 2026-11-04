@@ -69,8 +69,9 @@ on:
         description: The licence-gated engine image, pinned by digest (name@sha256:<64 hex>).
         type: string
         # Published GHCR image, pinned by digest (re-pin when the engine image is rebuilt).
-        # dep-graph build (Dossier #205-207): emits the dep_graph section the registry Map reads.
-        default: ghcr.io/settletop-inc/dossier-engine@sha256:b6a4e24cf0c1dfe0595e0b7a380a0c6f9d6856afb549733e3ecea6584e8df66b
+        # Dossier main @ d1e09ff (#208): model detection now drops docker base images and model: key
+        # leaks; still carries the dep-graph section (#205-207) the registry Graph reads.
+        default: ghcr.io/settletop-inc/dossier-engine@sha256:d7c0e806634fa866a43f6e0c243defff7612f569cb38cc1a5b901e9ca5de9cae
       engine-commit:
         description: The engine's source commit, recorded in run_meta. Empty records "Unknown".
         type: string
