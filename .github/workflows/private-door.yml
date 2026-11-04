@@ -111,11 +111,14 @@ defaults:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # licence. Fork guard: forks skip this job, so nothing downstream runs and no
-  # licence is requested (spec 4.2). PRs from forks are skipped too (no identity token).
+  # licence. Fork-PR guard: a pull request whose head is a fork skips this job (it has no
+  # identity token), so nothing downstream runs. A repo that is ITSELF a fork still scans on
+  # its own push / workflow_dispatch - those are the owning org's trusted events. The old
+  # `github.event.repository.fork != true` clause wrongly skipped those too, so a forked repo
+  # never scanned and the no-op run looked hung (spec 4.2).
   # ---------------------------------------------------------------------------
   licence:
-    if: github.event.repository.fork != true && github.event.pull_request.head.repo.fork != true
+    if: github.event.pull_request.head.repo.fork != true
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
