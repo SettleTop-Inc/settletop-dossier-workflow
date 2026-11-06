@@ -1,0 +1,32 @@
+# Move the stable `v1` tag to the latest reviewed door workflows. Both doors are consumed at `@v1`
+# (private caller + the opensource caller the registry commits), so re-pointing v1 is how a merged
+# engine-digest bump reaches consumers. The engine image stays digest-pinned INSIDE the door files;
+# only the ref `v1` moves. The opensource OIDC verify matches `...opensource-door.yml@refs/tags/v1`,
+# which does not change when the tag moves, so no Vercel edit is ever needed.
+name: Move v1
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/private-door.yml"
+      - ".github/workflows/opensource-door.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: move-v1
+  cancel-in-progress: false
+
+jobs:
+  retag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Force-move v1 to this commit
+        run: |
+          set -euo pipefail
+          git tag -f v1 "$GITHUB_SHA"
+          git push -f origin "refs/tags/v1"
