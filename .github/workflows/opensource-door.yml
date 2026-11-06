@@ -4,6 +4,13 @@
 # It clones a PUBLIC repo tokenless at the pinned commit, runs the SAME pinned engine image the private
 # door uses (no licence), and POSTs the engine share envelope to the opensource callback with a GitHub
 # OIDC id-token. runs-on is GitHub-hosted so a caller cannot route the run to a runner it controls.
+#
+# SECURITY: the engine image, the engine memory, the ingest audience and the callback URL are HARDCODED
+# below, NOT caller inputs. The caller workflow lives in the initiator's own host repo, so if any of these
+# were an input the initiator could point the scan at a forged engine and post a fabricated result into
+# the SHARED open-source dossier. Only the scan TARGET (repo, commit, scan_run_id) comes from the caller,
+# and the registry verifies repo/commit against its own scan_run row. Bump the engine digest here and
+# re-pin OPENSOURCE_REUSABLE + INGEST_OPENSOURCE_WORKFLOW_REF to the new commit SHA together.
 name: SettleTop Open-Source Door
 on:
   workflow_call:
@@ -20,54 +27,30 @@ on:
         description: the registry's single-use scan_run token
         required: true
         type: string
-      engine-image:
-        description: The engine image, pinned by digest (name@sha256:<64 hex>). Keep identical to the private door.
-        required: false
-        type: string
-        default: ghcr.io/settletop-inc/dossier-engine@sha256:d7c0e806634fa866a43f6e0c243defff7612f569cb38cc1a5b901e9ca5de9cae
-      engine-commit:
-        description: The engine's source commit, recorded in run_meta. Empty records "Unknown".
-        required: false
-        type: string
-        default: ""
-      engine-memory:
-        description: Memory limit for the engine container (docker --memory). Swap is disabled.
-        required: false
-        type: string
-        default: 4g
-      ingest-audience:
-        description: Fixed `aud` of the OIDC id-token sent to the registry callback.
-        required: false
-        type: string
-        default: https://ingest.settletop.com
-      opensource-ingest-url:
-        description: The opensource scan callback (POST /api/ingest/opensource-scan).
-        required: false
-        type: string
-        default: https://registry.settletop.com/api/ingest/opensource-scan
 jobs:
   scan:
     runs-on: ubuntu-latest # GitHub-hosted only: a caller cannot route this to a runner it controls
     timeout-minutes: 30
     permissions:
       id-token: write # mint the OIDC token the callback verifies; nothing else
+    env:
+      # Hardcoded, NOT caller inputs (see the SECURITY note above). Keep the engine image identical to the
+      # private door. Bumping the digest requires re-pinning OPENSOURCE_REUSABLE + INGEST_OPENSOURCE_WORKFLOW_REF.
+      ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:d7c0e806634fa866a43f6e0c243defff7612f569cb38cc1a5b901e9ca5de9cae
+      ENGINE_COMMIT: "" # engine source commit for run_meta; empty records "Unknown"
+      ENGINE_MEMORY: 4g
+      INGEST_AUDIENCE: https://ingest.settletop.com
+      CALLBACK_URL: https://registry.settletop.com/api/ingest/opensource-scan
     steps:
-      - name: Validate inputs
+      - name: Validate the scan target
         env:
           INPUT_REPO: ${{ inputs.repo }}
           INPUT_COMMIT: ${{ inputs.commit }}
-          ENGINE_IMAGE: ${{ inputs.engine-image }}
-          INGEST_URL: ${{ inputs.opensource-ingest-url }}
-          INGEST_AUDIENCE: ${{ inputs.ingest-audience }}
         run: |
           set -euo pipefail
           fail(){ echo "::error::$1"; exit 1; }
           [[ "$INPUT_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || fail "repo must be owner/name"
           [[ "$INPUT_COMMIT" =~ ^[0-9a-f]{7,40}$ ]] || fail "commit must be a hex SHA"
-          [[ "$ENGINE_IMAGE" =~ ^[a-z0-9][a-z0-9./_-]*@sha256:[0-9a-f]{64}$ ]] || fail "engine-image must be pinned by digest (name@sha256:<64 hex>)"
-          if [[ "$ENGINE_IMAGE" =~ @sha256:0{64}$ ]]; then fail "engine-image is still the placeholder digest"; fi
-          [[ "$INGEST_URL" =~ ^https://[^/[:space:]]+/.+ ]] || fail "opensource-ingest-url must be an https URL with a path"
-          [[ "$INGEST_AUDIENCE" =~ ^https://[^/[:space:]]+(/.*)?$ ]] || fail "ingest-audience must be an https URL"
 
       - name: Clone the public repo (tokenless) at the pinned commit
         env:
@@ -84,9 +67,6 @@ jobs:
       - name: Run the engine in a sandbox (pinned image, no network, read-only, non-root)
         env:
           INPUT_COMMIT: ${{ inputs.commit }}
-          ENGINE_IMAGE: ${{ inputs.engine-image }}
-          ENGINE_COMMIT: ${{ inputs.engine-commit }}
-          ENGINE_MEMORY: ${{ inputs.engine-memory }}
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/engine.log" # engine output stays on this runner, never the live log
@@ -129,8 +109,6 @@ jobs:
           INPUT_REPO: ${{ inputs.repo }}
           INPUT_COMMIT: ${{ inputs.commit }}
           SCAN_RUN_ID: ${{ inputs.scan_run_id }}
-          INGEST_AUDIENCE: ${{ inputs.ingest-audience }}
-          CALLBACK_URL: ${{ inputs.opensource-ingest-url }}
         run: |
           set -euo pipefail
           # 1. GitHub identity token for the fixed audience. Masked before it is used anywhere.
