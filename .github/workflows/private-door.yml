@@ -65,37 +65,10 @@ on:
         description: Size cap for the share view. Over it the report is "truncated" (spec 9.1) and not uploaded.
         type: number
         default: 5242880 # TODO(infra): 5 MiB placeholder. Set the real cap (spec 9.1).
-      engine-image:
-        description: The licence-gated engine image, pinned by digest (name@sha256:<64 hex>).
-        type: string
-        # Published GHCR image, pinned by digest (re-pin when the engine image is rebuilt).
-        # Dossier main @ d1e09ff (#208): model detection now drops docker base images and model: key
-        # leaks; still carries the dep-graph section (#205-207) the registry Graph reads.
-        default: ghcr.io/settletop-inc/dossier-engine@sha256:d7c0e806634fa866a43f6e0c243defff7612f569cb38cc1a5b901e9ca5de9cae
-      engine-commit:
-        description: The engine's source commit, recorded in run_meta. Empty records "Unknown".
-        type: string
-        default: "" # TODO(infra): better baked into the image than passed here.
-      engine-memory:
-        description: Memory limit for the engine container (docker --memory). Swap is disabled.
-        type: string
-        default: 4g
-      licence-url:
-        description: SettleTop licence service endpoint that exchanges the identity token for a licence.
-        type: string
-        default: https://registry.settletop.com/api/github/licence
-      licence-audience:
-        description: Fixed `aud` of the identity token sent to the licence service.
-        type: string
-        default: https://licence.settletop.com
-      registry-ingest-url:
-        description: Registry ingest endpoint (POST /api/ingest/scan). Used when share == registry.
-        type: string
-        default: https://registry.settletop.com/api/ingest/scan
-      registry-audience:
-        description: Fixed `aud` of the identity token sent to the registry ingest.
-        type: string
-        default: https://ingest.settletop.com
+      # SECURITY: engine-image, engine-commit, engine-memory and the licence / registry URLs + audiences are
+      # NO LONGER caller inputs. The caller workflow lives in the customer's OWN repo, so an input would let
+      # them run a forged engine image or redirect the licence / ingest calls for their own dossier. They are
+      # hardcoded in the steps below instead. Bump the engine digest there, identical to the open-source door.
     outputs:
       shared:
         description: "true if the share view was uploaded to the registry."
@@ -130,12 +103,12 @@ jobs:
     steps:
       - name: Preflight (inputs are configured and safe)
         env:
-          ENGINE_IMAGE: ${{ inputs.engine-image }}
-          LICENCE_URL: ${{ inputs.licence-url }}
-          LICENCE_AUDIENCE: ${{ inputs.licence-audience }}
+          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:d7c0e806634fa866a43f6e0c243defff7612f569cb38cc1a5b901e9ca5de9cae
+          LICENCE_URL: https://registry.settletop.com/api/github/licence
+          LICENCE_AUDIENCE: https://licence.settletop.com
           SHARE: ${{ inputs.share }}
-          INGEST_URL: ${{ inputs.registry-ingest-url }}
-          REGISTRY_AUDIENCE: ${{ inputs.registry-audience }}
+          INGEST_URL: https://registry.settletop.com/api/ingest/scan
+          REGISTRY_AUDIENCE: https://ingest.settletop.com
           KEEP: ${{ inputs.keep }}
         run: |
           set -euo pipefail
@@ -166,8 +139,8 @@ jobs:
 
       - name: Exchange the identity token for a licence
         env:
-          LICENCE_URL: ${{ inputs.licence-url }}
-          LICENCE_AUDIENCE: ${{ inputs.licence-audience }}
+          LICENCE_URL: https://registry.settletop.com/api/github/licence
+          LICENCE_AUDIENCE: https://licence.settletop.com
         run: |
           set -euo pipefail
           umask 077
@@ -236,9 +209,9 @@ jobs:
       - name: Run the engine in a sandbox
         id: engine
         env:
-          ENGINE_IMAGE: ${{ inputs.engine-image }}
-          ENGINE_COMMIT: ${{ inputs.engine-commit }}
-          ENGINE_MEMORY: ${{ inputs.engine-memory }}
+          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:d7c0e806634fa866a43f6e0c243defff7612f569cb38cc1a5b901e9ca5de9cae
+          ENGINE_COMMIT: ""
+          ENGINE_MEMORY: 4g
           REPOSITORY_ID: ${{ github.repository_id }}
           RUN_ID: ${{ github.run_id }}
           REPOSITORY: ${{ github.repository }}
@@ -507,7 +480,7 @@ jobs:
       - name: Validate digest, size and schema
         id: validate
         env:
-          ENGINE_IMAGE: ${{ inputs.engine-image }}
+          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:d7c0e806634fa866a43f6e0c243defff7612f569cb38cc1a5b901e9ca5de9cae
           MAX_BYTES: ${{ inputs.max-share-bytes }}
           EXPECT_SHA256: ${{ needs.check.outputs.share-file-sha256 }}
           EXPECT_BYTES: ${{ needs.check.outputs.share-file-bytes }}
@@ -588,8 +561,8 @@ jobs:
       - name: Upload to the registry (OIDC bearer)
         id: post
         env:
-          INGEST_URL: ${{ inputs.registry-ingest-url }}
-          REGISTRY_AUDIENCE: ${{ inputs.registry-audience }}
+          INGEST_URL: https://registry.settletop.com/api/ingest/scan
+          REGISTRY_AUDIENCE: https://ingest.settletop.com
           IDEMPOTENCY_KEY: ${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
