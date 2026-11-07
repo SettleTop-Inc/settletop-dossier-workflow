@@ -103,7 +103,7 @@ jobs:
     steps:
       - name: Preflight (inputs are configured and safe)
         env:
-          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:8534ee93b0e02b4ccc432782bf7f0ea2a6b6ca5f3c7463658468e768bb692b75
+          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:68f6a3e1628cd8d6b9aebb6d78804c184bd2e67c921a978c5594f985db298c81
           LICENCE_URL: https://registry.settletop.com/api/github/licence
           LICENCE_AUDIENCE: https://licence.settletop.com
           SHARE: ${{ inputs.share }}
@@ -209,7 +209,7 @@ jobs:
       - name: Run the engine in a sandbox
         id: engine
         env:
-          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:8534ee93b0e02b4ccc432782bf7f0ea2a6b6ca5f3c7463658468e768bb692b75
+          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:68f6a3e1628cd8d6b9aebb6d78804c184bd2e67c921a978c5594f985db298c81
           ENGINE_COMMIT: ""
           ENGINE_MEMORY: 4g
           REPOSITORY_ID: ${{ github.repository_id }}
@@ -480,7 +480,7 @@ jobs:
       - name: Validate digest, size and schema
         id: validate
         env:
-          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:8534ee93b0e02b4ccc432782bf7f0ea2a6b6ca5f3c7463658468e768bb692b75
+          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:68f6a3e1628cd8d6b9aebb6d78804c184bd2e67c921a978c5594f985db298c81
           MAX_BYTES: ${{ inputs.max-share-bytes }}
           EXPECT_SHA256: ${{ needs.check.outputs.share-file-sha256 }}
           EXPECT_BYTES: ${{ needs.check.outputs.share-file-bytes }}
