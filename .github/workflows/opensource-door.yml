@@ -36,7 +36,7 @@ jobs:
     env:
       # Hardcoded, NOT caller inputs (see the SECURITY note above). Keep the engine image identical to the
       # private door. Bumping the digest requires re-pinning OPENSOURCE_REUSABLE + INGEST_OPENSOURCE_WORKFLOW_REF.
-      ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:01988086ebf79dc02ace0a318764135a3254fc6da8ccd2087612f811907be2b1
+      ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:8cbad6c08c588af81da79c911e92c20b6f16a8f37c9b2c942a78464ac4cb5ea2
       ENGINE_COMMIT: "" # engine source commit for run_meta; empty records "Unknown"
       ENGINE_MEMORY: 4g
       INGEST_AUDIENCE: https://ingest.settletop.com
