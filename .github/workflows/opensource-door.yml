@@ -32,7 +32,8 @@ jobs:
     runs-on: ubuntu-latest # GitHub-hosted only: a caller cannot route this to a runner it controls
     timeout-minutes: 30
     permissions:
-      id-token: write # mint the OIDC token the callback verifies; nothing else
+      id-token: write # mint the OIDC token the callback verifies
+      packages: read  # gh attestation verify reads the engine image's attestation from GHCR
     env:
       # Hardcoded, NOT caller inputs (see the SECURITY note above). Keep the engine image identical to the
       # private door. Bumping the digest requires re-pinning OPENSOURCE_REUSABLE + INGEST_OPENSOURCE_WORKFLOW_REF.
@@ -63,6 +64,21 @@ jobs:
           git -C clone -c protocol.version=2 fetch -q --depth 1 origin "${INPUT_COMMIT}"
           git -C clone checkout -q FETCH_HEAD
           mkdir -p out
+
+      - name: Verify the engine image's build provenance
+        # Reject any engine image not built by our signer workflow BEFORE it runs (issue #298).
+        # --bundle-from-oci reads the attestation from the PUBLIC customer image in GHCR, so this works
+        # from the initiator's runner, which has no read access to our private SettleTop-AI-Dossier repo.
+        # Checks the SAME $ENGINE_IMAGE digest the run step below pulls, so the two cannot drift apart.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://$ENGINE_IMAGE" \
+            --bundle-from-oci \
+            --repo SettleTop-Inc/SettleTop-AI-Dossier \
+            --signer-workflow SettleTop-Inc/SettleTop-AI-Dossier/.github/workflows/engine-image.yml
+          echo "Engine image provenance verified: $ENGINE_IMAGE" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run the engine in a sandbox (pinned image, no network, read-only, non-root)
         env:
