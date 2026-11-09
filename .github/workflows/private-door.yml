@@ -187,7 +187,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
-      contents: read # the only permission (spec 4.2)
+      contents: read # check out the commit (spec 4.2)
+      packages: read # gh attestation verify reads the engine image's attestation from GHCR (#298)
+    env:
+      # One pinned digest for the whole job: the provenance-verify step and the run step below both use
+      # it, so the image we attest is exactly the image we run. The engine-image.yml bump re-pins this
+      # alongside the other copies in this file.
+      ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:baef2e48e43dc1f0c6e8c1accf258b097fe36dd661bb9db2da28ba761de5f82e
     outputs:
       report-artifact-id: ${{ steps.upload.outputs.artifact-id }}
       share-file-sha256: ${{ steps.engine.outputs.share-file-sha256 }}
@@ -206,10 +212,24 @@ jobs:
           path: ${{ runner.temp }}/licence
           merge-multiple: true
 
+      - name: Verify the engine image's build provenance
+        # Reject any engine image not built by our signer workflow BEFORE it runs (issue #298). This job
+        # gates the whole private door (share/keep/keep-* all `needs: check`), so one verify guards every
+        # engine run in the door. --bundle-from-oci reads the attestation from the PUBLIC customer image
+        # in GHCR, so it works from a customer runner that cannot read our private SettleTop-AI-Dossier repo.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://$ENGINE_IMAGE" \
+            --bundle-from-oci \
+            --repo SettleTop-Inc/SettleTop-AI-Dossier \
+            --signer-workflow SettleTop-Inc/SettleTop-AI-Dossier/.github/workflows/engine-image.yml
+          echo "Engine image provenance verified: $ENGINE_IMAGE" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Run the engine in a sandbox
         id: engine
         env:
-          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:baef2e48e43dc1f0c6e8c1accf258b097fe36dd661bb9db2da28ba761de5f82e
           ENGINE_COMMIT: ""
           ENGINE_MEMORY: 4g
           REPOSITORY_ID: ${{ github.repository_id }}
