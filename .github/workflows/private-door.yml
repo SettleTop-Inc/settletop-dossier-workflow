@@ -103,7 +103,7 @@ jobs:
     steps:
       - name: Preflight (inputs are configured and safe)
         env:
-          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:baef2e48e43dc1f0c6e8c1accf258b097fe36dd661bb9db2da28ba761de5f82e
+          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:620a7446e764c85f4ef64646835821d8a772e71aa299a781f34c842e5967a261
           LICENCE_URL: https://registry.settletop.com/api/github/licence
           LICENCE_AUDIENCE: https://licence.settletop.com
           SHARE: ${{ inputs.share }}
@@ -193,7 +193,7 @@ jobs:
       # One pinned digest for the whole job: the provenance-verify step and the run step below both use
       # it, so the image we attest is exactly the image we run. The engine-image.yml bump re-pins this
       # alongside the other copies in this file.
-      ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:baef2e48e43dc1f0c6e8c1accf258b097fe36dd661bb9db2da28ba761de5f82e
+      ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:620a7446e764c85f4ef64646835821d8a772e71aa299a781f34c842e5967a261
     outputs:
       report-artifact-id: ${{ steps.upload.outputs.artifact-id }}
       share-file-sha256: ${{ steps.engine.outputs.share-file-sha256 }}
@@ -502,7 +502,7 @@ jobs:
       - name: Validate digest, size and schema
         id: validate
         env:
-          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:baef2e48e43dc1f0c6e8c1accf258b097fe36dd661bb9db2da28ba761de5f82e
+          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:620a7446e764c85f4ef64646835821d8a772e71aa299a781f34c842e5967a261
           MAX_BYTES: ${{ inputs.max-share-bytes }}
           EXPECT_SHA256: ${{ needs.check.outputs.share-file-sha256 }}
           EXPECT_BYTES: ${{ needs.check.outputs.share-file-bytes }}
