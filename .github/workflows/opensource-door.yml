@@ -105,6 +105,7 @@ jobs:
             -v "$PWD/out:/out" \
             "$ENGINE_IMAGE" \
             scan --path /work/src --commit "${INPUT_COMMIT}" \
+              --image-digest "${ENGINE_IMAGE##*@}" \
               --share-out /out/share.json \
               --bom-out /out/bom.cdx.json \
               --sarif-out /out/results.sarif \
