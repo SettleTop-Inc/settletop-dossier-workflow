@@ -268,6 +268,7 @@ jobs:
             scan --path "/work/$repo_name" --commit "$commit" \
               --require-licence --repository-id "$REPOSITORY_ID" --run-id "$RUN_ID" \
               --include-hidden \
+              --image-digest "${ENGINE_IMAGE##*@}" \
               --share-out /out/share.json \
               --bom-out /out/bom.cdx.json \
               --sarif-out /out/results.sarif \
