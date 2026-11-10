@@ -127,6 +127,7 @@ jobs:
             "$ENGINE_IMAGE" \
             scan --path /work/src --commit "${INPUT_COMMIT}" \
               --image-digest "${ENGINE_IMAGE##*@}" \
+              --include-hidden \
               --share-out /out/share.json \
               --bom-out /out/bom.cdx.json \
               --trivy-bom-out /out/bom.trivy.cdx.json \
@@ -493,6 +494,7 @@ jobs:
           INPUT_REPO: ${{ inputs.repo }}
           INPUT_COMMIT: ${{ inputs.commit }}
           SCAN_RUN_ID: ${{ inputs.scan_run_id }}
+          RUN_STARTED_AT: ${{ github.run_started_at }} # #330: whole-run wall time -> run_meta.total_ms
           MAX_ENVELOPE_BYTES: "4194304" # TODO(infra): 4 MiB. The whole POST body stays under this.
         run: |
           set -euo pipefail
@@ -508,12 +510,28 @@ jobs:
           #    the registry binds identity from its own scan_run row and rejects a repo/commit mismatch.
           python3 -I - <<'PY'
           import json, os
+          from datetime import datetime, timezone
           e = os.environ
+          report = json.load(open("report/share.json", encoding="utf-8"))
+          # #330: stamp the whole-run wall time (run start -> this upload: checkout, engine, scanners) into
+          # the run_meta envelope so the dossier shows the real scan time, not just the engine's
+          # read+analyze slice. run_meta is NOT hashed (share_sha256 covers the share block only), so this
+          # never affects ingest verification. Only added to an engine-emitted run_metrics, never fabricated.
+          started = e.get("RUN_STARTED_AT")
+          if started:
+              try:
+                  t0 = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                  total_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
+                  rm = (report.get("run_meta") or {}).get("run_metrics")
+                  if isinstance(rm, dict) and total_ms >= 0:
+                      rm["total_ms"] = total_ms
+              except Exception:
+                  pass
           body = {
               "schema": "settletop.dossier-scan/2",
               "scan_run_id": e["SCAN_RUN_ID"],
               "subject": {"repo": e["INPUT_REPO"], "commit": e["INPUT_COMMIT"], "unit_path": None},
-              "report": json.load(open("report/share.json", encoding="utf-8")),
+              "report": report,
           }
           dump = lambda o: json.dumps(o, separators=(",", ":"), ensure_ascii=False)
           if os.path.exists("tool-envelope.json"):

@@ -876,6 +876,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
           COMMIT_SHA: ${{ needs.check.outputs.commit-sha }}
+          RUN_STARTED_AT: ${{ github.run_started_at }} # #330: whole-run wall time -> run_meta.total_ms
           MAX_ENVELOPE_BYTES: "4194304" # TODO(infra): 4 MiB. The whole POST body stays under this.
         run: |
           set -euo pipefail
@@ -885,7 +886,23 @@ jobs:
           # fills repository_owner_id and forge_repo_id from the OIDC token.
           python3 -I - <<'PY'
           import json, os
+          from datetime import datetime, timezone
           e = os.environ
+          report = json.load(open("report/share.json", encoding="utf-8"))
+          # #330: stamp the whole-run wall time (run start -> this upload) into the run_meta envelope so the
+          # dossier shows the real scan time, not just the engine's read+analyze slice. run_meta is NOT
+          # hashed (share_sha256 covers the share block only), so this never affects ingest verification.
+          # Only added to an engine-emitted run_metrics, never fabricated.
+          started = e.get("RUN_STARTED_AT")
+          if started:
+              try:
+                  t0 = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                  total_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
+                  rm = (report.get("run_meta") or {}).get("run_metrics")
+                  if isinstance(rm, dict) and total_ms >= 0:
+                      rm["total_ms"] = total_ms
+              except Exception:
+                  pass
           body = {
               "schema": "settletop.dossier-scan/2",
               "subject": {
@@ -898,7 +915,7 @@ jobs:
                   "run_attempt": int(e["RUN_ATTEMPT"]),
               },
               # The engine envelope: share view + share_sha256 + advisories + run_meta.
-              "report": json.load(open("report/share.json", encoding="utf-8")),
+              "report": report,
           }
           # The OSS-scanner tool envelope (advisories/imported/tools), when normalize produced one.
           # A SEPARATE top-level key: the registry upserts it onto the check id the share ingest
