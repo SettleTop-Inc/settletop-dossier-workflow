@@ -272,6 +272,7 @@ jobs:
               --image-digest "${ENGINE_IMAGE##*@}" \
               --share-out /out/share.json \
               --bom-out /out/bom.cdx.json \
+              --trivy-bom-out /out/bom.trivy.cdx.json \
               --sarif-out /out/results.sarif \
               --findings-out /out/findings.json \
               --html-out /out/summary.html \
@@ -448,6 +449,102 @@ jobs:
           path: ${{ runner.temp }}/out
           retention-days: 1
           if-no-files-found: error # tools-zizmor.json is always written, so this never trips
+
+  # ---------------------------------------------------------------------------
+  # tools-trivy-sbom (#826, epic #823). Scans the ENGINE's Trivy-facing BOM for known
+  # CVEs so every versioned component carries its advisories (canonical_key = the
+  # component bom-ref = Trivy's PkgIdentifier.BOMRef). This is a DIFFERENT scan from
+  # tools-trivy: that one scans the source tree (deploy posture), this one scans
+  # bom.trivy.cdx.json (the engine's CycloneDX 1.6 BOM written by --trivy-bom-out;
+  # Trivy rejects the 1.7 AI-BOM bom.cdx.json). It NEEDS the engine output, so it runs
+  # AFTER `check` (not in parallel) and downloads the report artifact for that BOM. It
+  # runs in its OWN job so the Trivy vuln-DB pull never widens the engine job's network
+  # surface. Soft-fails to `skipped` like tools-trivy; `share` folds trivy-sbom.json into
+  # the envelope via the engine's `normalize`. Gated like `share` (fork guard + share==
+  # registry): a run that will not share has nothing to map.
+  # ---------------------------------------------------------------------------
+  tools-trivy-sbom:
+    if: ${{ !cancelled() && github.event.pull_request.head.repo.fork != true && inputs.share == 'registry' && needs.check.result == 'success' }}
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      packages: read # authed ghcr pull of the Trivy vuln-DB (dodge the anon rate limit)
+    env:
+      TRIVY_VERSION: "0.76.2" # TODO(infra): bump to the current Trivy release; keep in step with tools-trivy
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Fetch the report (for bom.trivy.cdx.json)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.check.outputs.report-artifact-id }}
+          path: report
+          merge-multiple: true
+
+      - name: Install Trivy (pinned, checksum-verified)
+        continue-on-error: true # a blocked download must not fail the job; the scan step records `skipped`
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"
+          base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+          tgz="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$RUNNER_TEMP/$tgz" "$base/$tgz"
+          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$RUNNER_TEMP/trivy_checksums.txt" \
+            "$base/trivy_${TRIVY_VERSION}_checksums.txt"
+          ( cd "$RUNNER_TEMP" && grep " $tgz\$" trivy_checksums.txt | sha256sum -c - )
+          tar -xzf "$RUNNER_TEMP/$tgz" -C "$bin" trivy
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: "Scan the AI-BOM for CVEs (soft-fail to skipped)"
+        id: scan
+        continue-on-error: true
+        env:
+          # ghcr auth for the vuln-DB pull: anonymous ghcr is rate-limited and would flake the download.
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ github.token }} # authed ghcr.io/aquasecurity/trivy-db pull
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/out"; mkdir -p "$out"
+          cache="$RUNNER_TEMP/trivy-cache"
+          bom="report/bom.trivy.cdx.json" # the engine's 1.6 Trivy-facing BOM, not the 1.7 AI-BOM
+          status=skipped; db_snapshot=""
+          if command -v trivy > /dev/null && [ -s "$bom" ]; then
+            # 1. Pull the vuln-DB once (authed). A blocked/rate-limited pull soft-fails the whole job.
+            if trivy sbom --download-db-only --cache-dir "$cache" --timeout 5m 2> "$RUNNER_TEMP/trivy-db.log"; then
+              # Trivy stamps the DB build date in metadata.json; normalize records it on every advisory.
+              db_snapshot="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["UpdatedAt"][:10])' \
+                "$cache/db/metadata.json" 2>/dev/null || true)"
+              # 2. Scan the Trivy-facing BOM for vulns. Each carries PkgIdentifier.BOMRef (the component
+              #    bom-ref), which normalize reads as canonical_key. A non-zero exit means findings.
+              if trivy sbom --format json --scanners vuln --skip-db-update \
+                   --cache-dir "$cache" --timeout 10m --output "$out/trivy-sbom.json" "$bom" 2> "$RUNNER_TEMP/trivy-sbom.log" \
+                 && [ -s "$out/trivy-sbom.json" ]; then
+                status=ok
+              else
+                rm -f "$out/trivy-sbom.json"
+              fi
+            else
+              echo "::warning::Trivy vuln-DB pull failed; status=skipped (dossier unaffected)"
+            fi
+          elif [ ! -s "$bom" ]; then
+            echo "::warning::no bom.trivy.cdx.json in the report; trivy-sbom status=skipped"
+          else
+            echo "::warning::Trivy is not installed (download failed); status=skipped"
+          fi
+          python3 -I -c 'import json,sys; json.dump({"name":"trivy-sbom","version":sys.argv[1],"db_snapshot":sys.argv[2],"status":sys.argv[3]}, open(sys.argv[4],"w"))' \
+            "$TRIVY_VERSION" "$db_snapshot" "$status" "$out/tools-trivy-sbom.json"
+          echo "Trivy SBOM $TRIVY_VERSION: status=$status db_snapshot=${db_snapshot:-none}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pass the tool output on (1-day artifact)
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dossier-tools-trivy-sbom-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/out
+          retention-days: 1
+          if-no-files-found: error # tools-trivy-sbom.json is always written, so this never trips
 
   # ---------------------------------------------------------------------------
   # keep (spec 4.2.1). Always the caller's own token, never the App. One job per
@@ -639,7 +736,7 @@ jobs:
   # ---------------------------------------------------------------------------
   share:
     if: ${{ !cancelled() && inputs.share == 'registry' && needs.check.result == 'success' }}
-    needs: [check, tools-trivy, tools-zizmor]
+    needs: [check, tools-trivy, tools-zizmor, tools-trivy-sbom]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -737,17 +834,24 @@ jobs:
               return d.get("version", ""), d.get("db_snapshot", ""), d.get("status", "skipped")
           tv, tdb, ts = meta("tools-trivy.json", "trivy")
           zv, zdb, zs = meta("tools-zizmor.json", "zizmor")
+          sv, sdb, ss = meta("tools-trivy-sbom.json", "trivy-sbom")  # AI-BOM CVE scan (#826)
           args = []
           if os.path.exists(os.path.join(t, "trivy.json")):
               args += ["--trivy-json", "/in/trivy.json"]
+          # The AI-BOM CVE scan: normalize maps each vuln to an advisory with canonical_key =
+          # PkgIdentifier.BOMRef. When present it is the vuln source; --trivy-json is then misconfig-only.
+          if os.path.exists(os.path.join(t, "trivy-sbom.json")):
+              args += ["--trivy-sbom-json", "/in/trivy-sbom.json"]
           if os.path.exists(os.path.join(t, "zizmor.sarif")):
               args += ["--sarif", "/in/zizmor.sarif:zizmor"]
           if os.path.exists(os.path.join(t, "findings.json")):
               args += ["--findings", "/in/findings.json"]
-          if tdb:
-              args += ["--db-snapshot", tdb]   # the Trivy vuln-DB date; re-scans upsert on it
+          db = tdb or sdb  # fs and sbom pull the same vuln-DB; use whichever ran
+          if db:
+              args += ["--db-snapshot", db]   # the Trivy vuln-DB date; re-scans upsert on it
           args += ["--tool", f"trivy:{tv}:{tdb}:{ts}"]
           args += ["--tool", f"zizmor:{zv}:{zdb}:{zs}"]
+          args += ["--tool", f"trivy-sbom:{sv}:{sdb}:{ss}"]
           print("\n".join(args))
           PY
           mapfile -t NARGS < "$RUNNER_TEMP/nargs"
@@ -772,6 +876,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
           COMMIT_SHA: ${{ needs.check.outputs.commit-sha }}
+          MAX_ENVELOPE_BYTES: "4194304" # TODO(infra): 4 MiB. The whole POST body stays under this.
         run: |
           set -euo pipefail
           # The registry binds the owner from the OIDC token, not from this payload (it ignores
@@ -799,10 +904,34 @@ jobs:
           # A SEPARATE top-level key: the registry upserts it onto the check id the share ingest
           # returns, best-effort. It never changes `report` or any hash, so the core dossier bytes
           # are identical to a no-tool run.
+          dump = lambda o: json.dumps(o, separators=(",", ":"), ensure_ascii=False)
           if os.path.exists("tool-envelope.json"):
-              body["envelope"] = json.load(open("tool-envelope.json", encoding="utf-8"))
+              env_obj = json.load(open("tool-envelope.json", encoding="utf-8"))
+              # Byte-cap guard (#826): normalize dedupes but does NOT cap, so the workflow caps the
+              # advisory list here. Keep the most severe, drop the rest, and LOG the count (never
+              # silent). The cap is on the envelope's own bytes; the share view has its own size cap.
+              cap = int(e["MAX_ENVELOPE_BYTES"])
+              advs = env_obj.get("advisories", [])
+              rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+              ordered = sorted(advs, key=lambda a: rank.get(a.get("severity"), 5))
+              lo, hi = 0, len(ordered)
+              while lo < hi:  # largest worst-first prefix whose envelope fits the cap
+                  mid = (lo + hi + 1) // 2
+                  if len(dump({**env_obj, "advisories": ordered[:mid]}).encode()) <= cap:
+                      lo = mid
+                  else:
+                      hi = mid - 1
+              env_obj["advisories"] = ordered[:lo]
+              if len(dump(env_obj).encode()) <= cap:
+                  body["envelope"] = env_obj
+                  if lo < len(advs):
+                      print(f"::warning::tool envelope over the {cap}-byte cap; kept the {lo} most "
+                            f"severe of {len(advs)} advisories, dropped {len(advs) - lo}")
+              else:
+                  print(f"::warning::tool envelope exceeds the {cap}-byte cap even with no advisories; "
+                        f"posting the core dossier without it")
           with open("envelope.json", "w", encoding="utf-8") as f:
-              json.dump(body, f, separators=(",", ":"), ensure_ascii=False)
+              f.write(dump(body))
           PY
 
       - name: Upload to the registry (OIDC bearer)
@@ -838,7 +967,7 @@ jobs:
   # ---------------------------------------------------------------------------
   cleanup:
     if: always() && needs.licence.result != 'skipped'
-    needs: [licence, check, tools-trivy, tools-zizmor, keep, keep-checks, keep-security-tab, keep-release, share]
+    needs: [licence, check, tools-trivy, tools-zizmor, tools-trivy-sbom, keep, keep-checks, keep-security-tab, keep-release, share]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -852,6 +981,7 @@ jobs:
           IDS: >-
             ${{ needs.licence.outputs.artifact-id }} ${{ needs.check.outputs.report-artifact-id }}
             ${{ needs.tools-trivy.outputs.artifact-id }} ${{ needs.tools-zizmor.outputs.artifact-id }}
+            ${{ needs.tools-trivy-sbom.outputs.artifact-id }}
         run: |
           set -uo pipefail
           for id in $IDS; do
