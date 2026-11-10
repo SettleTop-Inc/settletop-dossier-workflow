@@ -167,7 +167,7 @@ jobs:
       # The artifact lives one day at most, and `cleanup` deletes it by id.
       - name: Pass the licence on (1-day artifact)
         id: upload
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dossier-licence-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/licence/licence.txt
@@ -202,12 +202,12 @@ jobs:
       commit-sha: ${{ steps.engine.outputs.commit-sha }}
     steps:
       - name: Check out the commit
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false # the token must not sit in .git/config
 
       - name: Fetch the licence
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.licence.outputs.artifact-id }}
           path: ${{ runner.temp }}/licence
@@ -296,7 +296,7 @@ jobs:
       # The only copy the workflow makes beyond `keep`. `cleanup` deletes it by id.
       - name: Pass the report on (1-day artifact)
         id: upload
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dossier-report-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/out
@@ -329,7 +329,7 @@ jobs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - name: Check out the commit
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -388,7 +388,7 @@ jobs:
       - name: Pass the tool output on (1-day artifact)
         id: upload
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dossier-tools-trivy-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/out
@@ -407,7 +407,7 @@ jobs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - name: Check out the commit
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -442,7 +442,7 @@ jobs:
       - name: Pass the tool output on (1-day artifact)
         id: upload
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dossier-tools-zizmor-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/out
@@ -461,7 +461,7 @@ jobs:
     permissions: {}
     steps:
       - name: Fetch the report
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.check.outputs.report-artifact-id }}
           path: report
@@ -502,7 +502,7 @@ jobs:
 
       - name: Keep as a workflow artifact
         if: contains(format(',{0},', inputs.keep), ',artifact,')
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           # Separately named from the transfer artifacts, so `cleanup` leaves it alone.
           # Holds: full report JSON (findings.json), SARIF, BOM, share view, HTML summary.
@@ -521,7 +521,7 @@ jobs:
       checks: write
     steps:
       - name: Fetch the report
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.check.outputs.report-artifact-id }}
           path: report
@@ -581,7 +581,7 @@ jobs:
       actions: read
     steps:
       - name: Fetch the report
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.check.outputs.report-artifact-id }}
           path: report
@@ -602,7 +602,7 @@ jobs:
       contents: write
     steps:
       - name: Fetch the report
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.check.outputs.report-artifact-id }}
           path: report
@@ -649,7 +649,7 @@ jobs:
       share-sha256: ${{ steps.validate.outputs.share-sha256 }}
     steps:
       - name: Download the report by artifact id
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.check.outputs.report-artifact-id }}
           path: report
@@ -707,7 +707,7 @@ jobs:
       # exist; the download is tolerant only as defense.
       - name: Fetch the scanner output (best-effort)
         continue-on-error: true
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: dossier-tools-*-${{ github.run_id }}-${{ github.run_attempt }}
           path: tools
