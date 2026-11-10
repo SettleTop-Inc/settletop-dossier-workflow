@@ -21,6 +21,7 @@
 #         contents: write         #   keep-release only; check and the rest stay at read
 #         checks: write           #   keep-checks
 #         security-events: write  #   keep-security-tab
+#         packages: read          #   check (engine attestation) + tools-trivy (authed vuln-DB pull)
 #         actions: write          #   cleanup (spec 4.2: the caller's own token, never the App)
 #       with:
 #         keep: summary,artifact  # summary,checks,artifact,security-tab,release,none
@@ -303,6 +304,152 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
+  # tools-trivy / tools-zizmor (#317, epic #310). OSS deploy scanners that run in
+  # PARALLEL to `check` (no `needs`), so they add ~no wall-clock. They send NOTHING
+  # out: each writes its findings file + a one-line tools-*.json (name/version/
+  # db_snapshot/status) to a 1-day transfer artifact that `share` folds into the
+  # tool envelope with the engine's `normalize`. Decoupled by design - every tool
+  # error SOFT-FAILS to status `skipped` (a blocked vuln-DB pull, a crash, no
+  # workflows), so a scanner NEVER fails the dossier. Gated exactly like `share`
+  # (fork guard + share==registry): the envelope only goes to the registry, so a
+  # run that will not share has nothing to scan for.
+  # ---------------------------------------------------------------------------
+  tools-trivy:
+    if: ${{ github.event.pull_request.head.repo.fork != true && inputs.share == 'registry' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read # check out the commit to scan
+      packages: read # authed ghcr pull of the Trivy vuln-DB (dodge the anon rate limit)
+    env:
+      # Infra-owned, bumped like the engine digest. Pinned by exact version; the tarball is
+      # checksum-verified against the release's own checksums.txt before it runs.
+      TRIVY_VERSION: "0.76.2" # TODO(infra): bump to the current Trivy release
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Trivy (pinned, checksum-verified)
+        continue-on-error: true # a blocked download must not fail the job; the scan step records `skipped`
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"
+          base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+          tgz="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$RUNNER_TEMP/$tgz" "$base/$tgz"
+          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$RUNNER_TEMP/trivy_checksums.txt" \
+            "$base/trivy_${TRIVY_VERSION}_checksums.txt"
+          ( cd "$RUNNER_TEMP" && grep " $tgz\$" trivy_checksums.txt | sha256sum -c - )
+          tar -xzf "$RUNNER_TEMP/$tgz" -C "$bin" trivy
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: "Scan the tree (fs vuln + misconfig; soft-fail to skipped)"
+        id: scan
+        continue-on-error: true
+        env:
+          # ghcr auth for the vuln-DB pull: anonymous ghcr is rate-limited and would flake the
+          # download. Trivy uses these creds for the ghcr.io/aquasecurity/trivy-db pull.
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/out"; mkdir -p "$out"
+          cache="$RUNNER_TEMP/trivy-cache"
+          status=skipped; db_snapshot=""
+          if command -v trivy > /dev/null; then
+            # 1. Pull the vuln-DB once (authed). A blocked/rate-limited pull soft-fails the whole job.
+            if trivy fs --download-db-only --cache-dir "$cache" --timeout 5m 2> "$RUNNER_TEMP/trivy-db.log"; then
+              # Trivy stamps the DB build date in metadata.json; normalize records it on every advisory.
+              db_snapshot="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["UpdatedAt"][:10])' \
+                "$cache/db/metadata.json" 2>/dev/null || true)"
+              # 2. Scan: vulnerabilities + misconfigurations only, secret scanner OFF, no DB update
+              #    (step 1 cached it). A non-zero exit here means findings, not a tool failure.
+              if trivy fs --scanners vuln,misconfig --format json --skip-db-update \
+                   --cache-dir "$cache" --timeout 10m --output "$out/trivy.json" . 2> "$RUNNER_TEMP/trivy-scan.log" \
+                 && [ -s "$out/trivy.json" ]; then
+                status=ok
+              else
+                rm -f "$out/trivy.json"
+              fi
+            else
+              echo "::warning::Trivy vuln-DB pull failed; status=skipped (dossier unaffected)"
+            fi
+          else
+            echo "::warning::Trivy is not installed (download failed); status=skipped"
+          fi
+          python3 -I -c 'import json,sys; json.dump({"name":"trivy","version":sys.argv[1],"db_snapshot":sys.argv[2],"status":sys.argv[3]}, open(sys.argv[4],"w"))' \
+            "$TRIVY_VERSION" "$db_snapshot" "$status" "$out/tools-trivy.json"
+          echo "Trivy $TRIVY_VERSION: status=$status db_snapshot=${db_snapshot:-none}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pass the tool output on (1-day artifact)
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dossier-tools-trivy-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/out
+          retention-days: 1
+          if-no-files-found: error # tools-trivy.json is always written, so this never trips
+
+  tools-zizmor:
+    if: ${{ github.event.pull_request.head.repo.fork != true && inputs.share == 'registry' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # check out the commit to scan
+    env:
+      ZIZMOR_VERSION: "1.32.0" # TODO(infra): bump to the current zizmor release
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Scan the workflows (SARIF; soft-fail to `skipped`)
+        id: scan
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }} # zizmor's online audits query the GitHub API
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/out"; mkdir -p "$out"
+          status=skipped
+          if [ -d .github/workflows ]; then
+            # pipx runs the pinned zizmor ephemerally (PyPI wheel; no Python-env leakage). zizmor
+            # exits non-zero when it FINDS issues - that is not a tool failure, so status is `ok`
+            # whenever a valid SARIF was written, else `skipped` (crash / pipx missing).
+            pipx run "zizmor==${ZIZMOR_VERSION}" --format sarif .github/workflows \
+              > "$out/zizmor.sarif" 2> "$RUNNER_TEMP/zizmor.log" || true
+            if python3 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("runs") is not None else 1)' \
+                 "$out/zizmor.sarif" 2>/dev/null; then
+              status=ok
+            else
+              rm -f "$out/zizmor.sarif"
+            fi
+          else
+            echo "::notice::no .github/workflows to scan; zizmor status=skipped"
+          fi
+          python3 -I -c 'import json,sys; json.dump({"name":"zizmor","version":sys.argv[1],"db_snapshot":"","status":sys.argv[2]}, open(sys.argv[3],"w"))' \
+            "$ZIZMOR_VERSION" "$status" "$out/tools-zizmor.json"
+          echo "zizmor $ZIZMOR_VERSION: status=$status" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pass the tool output on (1-day artifact)
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dossier-tools-zizmor-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/out
+          retention-days: 1
+          if-no-files-found: error # tools-zizmor.json is always written, so this never trips
+
+  # ---------------------------------------------------------------------------
   # keep (spec 4.2.1). Always the caller's own token, never the App. One job per
   # output so each holds only the permission that output needs.
   # ---------------------------------------------------------------------------
@@ -479,11 +626,20 @@ jobs:
   # settletop.dossier-scan/2 envelope to the registry ingest, authenticated by a
   # GitHub OIDC token with a fixed audience (the registry pins aud, the numeric
   # repository_id / repository_owner_id and job_workflow_ref server-side).
-  # Only the share view leaves: findings.json (with locations) is never read here.
+  # What leaves: the share view, and - when the OSS scanners ran - a SEPARATE tool
+  # `envelope` built here by `normalize` (#318). findings.json is read LOCALLY by
+  # normalize for dedup only; neither it nor any source text ever leaves.
+  #
+  # The tool envelope is BEST-EFFORT and rides in the SAME upload body as a top-level
+  # `envelope` key (the registry links it to the share by the check id the share
+  # ingest returns; there is no separate advisory endpoint). It never touches `report`
+  # or any hash. `needs` the scanners only to ORDER after them; `if` runs share even
+  # when a scanner failed/was skipped, so the core dossier upload is never blocked by
+  # a scanner (spec #310/#318: a tool failure loses only the CVE posture).
   # ---------------------------------------------------------------------------
   share:
-    if: inputs.share == 'registry'
-    needs: check
+    if: ${{ !cancelled() && inputs.share == 'registry' && needs.check.result == 'success' }}
+    needs: [check, tools-trivy, tools-zizmor]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -545,6 +701,69 @@ jobs:
             exit 1
           fi
 
+      # --- CVE posture (#318). Everything from here to the end of this step is BEST-EFFORT:
+      # a missing artifact or a normalize error logs a warning and the core dossier uploads
+      # alone. The scanners always ran when share runs (same gate), so the artifacts normally
+      # exist; the download is tolerant only as defense.
+      - name: Fetch the scanner output (best-effort)
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: dossier-tools-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tools
+          merge-multiple: true
+
+      - name: Normalize scanner output into the tool envelope (best-effort)
+        continue-on-error: true # a normalize failure must never block the core share upload
+        env:
+          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:19b591f8ec98e33e63a5c8343e300daa0738e73471d781372f8ac2c81fcd94b1
+          REPOSITORY_ID: ${{ github.repository_id }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p tools
+          # findings.json rides in the report artifact; normalize reads it ONLY to dedup overlaps.
+          cp report/findings.json tools/findings.json 2>/dev/null || true
+          # Build normalize's args from each tool's recorded meta (name:version:db:status) and the
+          # files it actually produced. A `skipped` tool contributes only a --tool status row.
+          python3 -I - tools > "$RUNNER_TEMP/nargs" <<'PY'
+          import json, os, sys
+          t = sys.argv[1]
+          def meta(fname, name):
+              try:
+                  d = json.load(open(os.path.join(t, fname)))
+              except Exception:
+                  d = {"name": name}
+              return d.get("version", ""), d.get("db_snapshot", ""), d.get("status", "skipped")
+          tv, tdb, ts = meta("tools-trivy.json", "trivy")
+          zv, zdb, zs = meta("tools-zizmor.json", "zizmor")
+          args = []
+          if os.path.exists(os.path.join(t, "trivy.json")):
+              args += ["--trivy-json", "/in/trivy.json"]
+          if os.path.exists(os.path.join(t, "zizmor.sarif")):
+              args += ["--sarif", "/in/zizmor.sarif:zizmor"]
+          if os.path.exists(os.path.join(t, "findings.json")):
+              args += ["--findings", "/in/findings.json"]
+          if tdb:
+              args += ["--db-snapshot", tdb]   # the Trivy vuln-DB date; re-scans upsert on it
+          args += ["--tool", f"trivy:{tv}:{tdb}:{ts}"]
+          args += ["--tool", f"zizmor:{zv}:{zdb}:{zs}"]
+          print("\n".join(args))
+          PY
+          mapfile -t NARGS < "$RUNNER_TEMP/nargs"
+          nout="$RUNNER_TEMP/nout"; mkdir -p "$nout"
+          # Same sandbox shape as `validate` above: no network, non-root, read-only root, caps dropped.
+          # normalize drops any SEC-tripping row itself; it never touches share or any hash.
+          docker pull --quiet "$ENGINE_IMAGE" > /dev/null
+          docker run --rm --network none --user "$(id -u):$(id -g)" --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m --cap-drop ALL --security-opt no-new-privileges \
+            --memory 512m --memory-swap 512m --pids-limit 64 \
+            -v "$PWD/tools:/in:ro" -v "$nout:/out" "$ENGINE_IMAGE" \
+            normalize --repository-id "$REPOSITORY_ID" --run-id "$RUN_ID" \
+              "${NARGS[@]}" --out /out/envelope.json
+          [ -s "$nout/envelope.json" ] || { echo "::warning::normalize produced no envelope"; exit 1; }
+          cp "$nout/envelope.json" tool-envelope.json  # present only on success; the build step keys off it
+
       - name: Build the settletop.dossier-scan/2 envelope
         env:
           REPOSITORY_ID: ${{ github.repository_id }}
@@ -562,7 +781,7 @@ jobs:
           python3 -I - <<'PY'
           import json, os
           e = os.environ
-          envelope = {
+          body = {
               "schema": "settletop.dossier-scan/2",
               "subject": {
                   "forge": "github",
@@ -576,8 +795,14 @@ jobs:
               # The engine envelope: share view + share_sha256 + advisories + run_meta.
               "report": json.load(open("report/share.json", encoding="utf-8")),
           }
+          # The OSS-scanner tool envelope (advisories/imported/tools), when normalize produced one.
+          # A SEPARATE top-level key: the registry upserts it onto the check id the share ingest
+          # returns, best-effort. It never changes `report` or any hash, so the core dossier bytes
+          # are identical to a no-tool run.
+          if os.path.exists("tool-envelope.json"):
+              body["envelope"] = json.load(open("tool-envelope.json", encoding="utf-8"))
           with open("envelope.json", "w", encoding="utf-8") as f:
-              json.dump(envelope, f, separators=(",", ":"), ensure_ascii=False)
+              json.dump(body, f, separators=(",", ":"), ensure_ascii=False)
           PY
 
       - name: Upload to the registry (OIDC bearer)
@@ -613,7 +838,7 @@ jobs:
   # ---------------------------------------------------------------------------
   cleanup:
     if: always() && needs.licence.result != 'skipped'
-    needs: [licence, check, keep, keep-checks, keep-security-tab, keep-release, share]
+    needs: [licence, check, tools-trivy, tools-zizmor, keep, keep-checks, keep-security-tab, keep-release, share]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -623,8 +848,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          # An id is empty when its job never got as far as uploading.
-          IDS: ${{ needs.licence.outputs.artifact-id }} ${{ needs.check.outputs.report-artifact-id }}
+          # An id is empty when its job never got as far as uploading (e.g. a skipped scanner).
+          IDS: >-
+            ${{ needs.licence.outputs.artifact-id }} ${{ needs.check.outputs.report-artifact-id }}
+            ${{ needs.tools-trivy.outputs.artifact-id }} ${{ needs.tools-zizmor.outputs.artifact-id }}
         run: |
           set -uo pipefail
           for id in $IDS; do

@@ -11,6 +11,7 @@ jobs:
       contents: write         # keep: release
       checks: write           # keep: checks
       security-events: write  # keep: security-tab
+      packages: read          # check (engine attestation) + tools-trivy (authed vuln-DB pull)
       actions: write          # cleanup
     with:
       share: registry
