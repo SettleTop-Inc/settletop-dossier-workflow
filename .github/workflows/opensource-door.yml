@@ -129,6 +129,7 @@ jobs:
               --image-digest "${ENGINE_IMAGE##*@}" \
               --share-out /out/share.json \
               --bom-out /out/bom.cdx.json \
+              --trivy-bom-out /out/bom.trivy.cdx.json \
               --sarif-out /out/results.sarif \
               --findings-out /out/findings.json \
               --html-out /out/summary.html \
@@ -310,15 +311,16 @@ jobs:
           if-no-files-found: error # tools-zizmor.json is always written, so this never trips
 
   # ---------------------------------------------------------------------------
-  # tools-trivy-sbom (#826, epic #823). Scans the ENGINE's AI-BOM for known CVEs so every
-  # versioned component carries its advisories (canonical_key = the component bom-ref =
-  # Trivy's PkgIdentifier.BOMRef). Unlike tools-trivy (which scans the source clone for
-  # deploy posture), this NEEDS the engine output, so it runs AFTER `scan` and downloads
-  # the report artifact for bom.cdx.json. The scan TARGET stays the registry-verified repo:
-  # the only input here is the engine's own BOM, and the only new network call is the Trivy
-  # vuln-DB pull (authed ghcr). It runs in its OWN job so that pull never widens the hardened
-  # `scan` job's surface. Soft-fails to `skipped`; `upload` folds trivy-sbom.json into the
-  # envelope via normalize. It sends NOTHING out itself (only `upload` posts).
+  # tools-trivy-sbom (#826, epic #823). Scans the ENGINE's Trivy-facing BOM for known CVEs so
+  # every versioned component carries its advisories (canonical_key = the component bom-ref =
+  # Trivy's PkgIdentifier.BOMRef). Unlike tools-trivy (which scans the source clone for deploy
+  # posture), this NEEDS the engine output, so it runs AFTER `scan` and downloads the report
+  # artifact for bom.trivy.cdx.json (the engine's CycloneDX 1.6 BOM from --trivy-bom-out; Trivy
+  # rejects the 1.7 AI-BOM). The scan TARGET stays the registry-verified repo: the only input
+  # here is the engine's own BOM, and the only new network call is the Trivy vuln-DB pull (authed
+  # ghcr). It runs in its OWN job so that pull never widens the hardened `scan` job's surface.
+  # Soft-fails to `skipped`; `upload` folds trivy-sbom.json into the envelope via normalize. It
+  # sends NOTHING out itself (only `upload` posts).
   # ---------------------------------------------------------------------------
   tools-trivy-sbom:
     if: ${{ !cancelled() && needs.scan.result == 'success' }}
@@ -332,7 +334,7 @@ jobs:
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
-      - name: Fetch the report (for bom.cdx.json)
+      - name: Fetch the report (for bom.trivy.cdx.json)
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.scan.outputs.report-artifact-id }}
@@ -363,14 +365,14 @@ jobs:
           set -uo pipefail
           out="$RUNNER_TEMP/out"; mkdir -p "$out"
           cache="$RUNNER_TEMP/trivy-cache"
-          bom="report/bom.cdx.json"
+          bom="report/bom.trivy.cdx.json" # the engine's 1.6 Trivy-facing BOM, not the 1.7 AI-BOM
           status=skipped; db_snapshot=""
           if command -v trivy > /dev/null && [ -s "$bom" ]; then
             if trivy sbom --download-db-only --cache-dir "$cache" --timeout 5m 2> "$RUNNER_TEMP/trivy-db.log"; then
               db_snapshot="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["UpdatedAt"][:10])' \
                 "$cache/db/metadata.json" 2>/dev/null || true)"
               # Each vuln carries PkgIdentifier.BOMRef (the component bom-ref); normalize reads it as canonical_key.
-              if trivy sbom --format json --skip-db-update \
+              if trivy sbom --format json --scanners vuln --skip-db-update \
                    --cache-dir "$cache" --timeout 10m --output "$out/trivy-sbom.json" "$bom" 2> "$RUNNER_TEMP/trivy-sbom.log" \
                  && [ -s "$out/trivy-sbom.json" ]; then
                 status=ok
@@ -381,7 +383,7 @@ jobs:
               echo "::warning::Trivy vuln-DB pull failed; status=skipped (dossier unaffected)"
             fi
           elif [ ! -s "$bom" ]; then
-            echo "::warning::no bom.cdx.json in the report; trivy-sbom status=skipped"
+            echo "::warning::no bom.trivy.cdx.json in the report; trivy-sbom status=skipped"
           else
             echo "::warning::Trivy is not installed (download failed); status=skipped"
           fi
@@ -457,7 +459,7 @@ jobs:
           if os.path.exists(os.path.join(t, "trivy.json")):
               args += ["--trivy-json", "/in/trivy.json"]
           # The AI-BOM CVE scan: normalize maps each vuln to an advisory with canonical_key =
-          # PkgIdentifier.BOMRef. TODO(engine): confirm the flag name with aibom-engine (#823).
+          # PkgIdentifier.BOMRef. When present it is the vuln source; --trivy-json is then misconfig-only.
           if os.path.exists(os.path.join(t, "trivy-sbom.json")):
               args += ["--trivy-sbom-json", "/in/trivy-sbom.json"]
           if os.path.exists(os.path.join(t, "zizmor.sarif")):
@@ -516,16 +518,29 @@ jobs:
           dump = lambda o: json.dumps(o, separators=(",", ":"), ensure_ascii=False)
           if os.path.exists("tool-envelope.json"):
               env_obj = json.load(open("tool-envelope.json", encoding="utf-8"))
-              # Byte-cap guard (#826): normalize caps/chunks advisories upstream; this is the last-resort
-              # floor so a runaway envelope never fails the core POST into the SHARED dossier. Drop it
-              # whole and log (never silent) rather than send a body the callback would reject.
-              size = len(dump({**body, "envelope": env_obj}).encode())
-              if size <= int(e["MAX_ENVELOPE_BYTES"]):
+              # Byte-cap guard (#826): normalize dedupes but does NOT cap, so the workflow caps the
+              # advisory list here. Keep the most severe, drop the rest, and LOG the count (never
+              # silent) before posting into the SHARED open-source dossier.
+              cap = int(e["MAX_ENVELOPE_BYTES"])
+              advs = env_obj.get("advisories", [])
+              rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+              ordered = sorted(advs, key=lambda a: rank.get(a.get("severity"), 5))
+              lo, hi = 0, len(ordered)
+              while lo < hi:  # largest worst-first prefix whose envelope fits the cap
+                  mid = (lo + hi + 1) // 2
+                  if len(dump({**env_obj, "advisories": ordered[:mid]}).encode()) <= cap:
+                      lo = mid
+                  else:
+                      hi = mid - 1
+              env_obj["advisories"] = ordered[:lo]
+              if len(dump(env_obj).encode()) <= cap:
                   body["envelope"] = env_obj
+                  if lo < len(advs):
+                      print(f"::warning::tool envelope over the {cap}-byte cap; kept the {lo} most "
+                            f"severe of {len(advs)} advisories, dropped {len(advs) - lo}")
               else:
-                  n = len(env_obj.get("advisories", []))
-                  print(f"::warning::tool envelope ({size} bytes, {n} advisories) over the "
-                        f"{e['MAX_ENVELOPE_BYTES']}-byte cap; posting the core dossier without it")
+                  print(f"::warning::tool envelope exceeds the {cap}-byte cap even with no advisories; "
+                        f"posting the core dossier without it")
           with open("payload.json", "w", encoding="utf-8") as f:
               f.write(dump(body))
           PY
