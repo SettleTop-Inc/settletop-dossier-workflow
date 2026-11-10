@@ -40,7 +40,7 @@ on:
 
 # Hardcoded, NOT caller inputs (see the SECURITY note above). Shared by `scan` and `upload`.
 env:
-  ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:19b591f8ec98e33e63a5c8343e300daa0738e73471d781372f8ac2c81fcd94b1
+  ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:4df5c129775651767a4eedc13542dfa363816ae9a7335f25b30ebc1d76470a67
   ENGINE_COMMIT: "" # engine source commit for run_meta; empty records "Unknown"
   ENGINE_MEMORY: 4g
   INGEST_AUDIENCE: https://ingest.settletop.com
