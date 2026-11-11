@@ -200,7 +200,14 @@ jobs:
       share-file-sha256: ${{ steps.engine.outputs.share-file-sha256 }}
       share-file-bytes: ${{ steps.engine.outputs.share-file-bytes }}
       commit-sha: ${{ steps.engine.outputs.commit-sha }}
+      run-started-at: ${{ steps.runstart.outputs.at }}
     steps:
+      - name: Mark run start (#330 whole-run wall time -> run_meta.total_ms)
+        id: runstart
+        # github.run_started_at is not a real context field (resolves empty). Stamp the job start as a
+        # job output so the share job (a separate job) can read it; $GITHUB_ENV would not cross jobs.
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" >> "$GITHUB_OUTPUT"
+
       - name: Check out the commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -876,7 +883,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
           COMMIT_SHA: ${{ needs.check.outputs.commit-sha }}
-          RUN_STARTED_AT: ${{ github.run_started_at }} # #330: whole-run wall time -> run_meta.total_ms
+          RUN_STARTED_AT: ${{ needs.check.outputs.run-started-at }} # #330: whole-run wall time -> run_meta.total_ms
           MAX_ENVELOPE_BYTES: "4194304" # TODO(infra): 4 MiB. The whole POST body stays under this.
         run: |
           set -euo pipefail
