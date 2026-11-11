@@ -63,7 +63,14 @@ jobs:
       packages: read # gh attestation verify reads the engine image's attestation from GHCR
     outputs:
       report-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      run-started-at: ${{ steps.runstart.outputs.at }}
     steps:
+      - name: Mark run start (#330 whole-run wall time -> run_meta.total_ms)
+        id: runstart
+        # github.run_started_at is not a real context field (resolves empty). Stamp the job start as a
+        # job output so the upload job (a separate job) can read it; $GITHUB_ENV would not cross jobs.
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" >> "$GITHUB_OUTPUT"
+
       - name: Validate the scan target
         env:
           INPUT_REPO: ${{ inputs.repo }}
@@ -494,7 +501,7 @@ jobs:
           INPUT_REPO: ${{ inputs.repo }}
           INPUT_COMMIT: ${{ inputs.commit }}
           SCAN_RUN_ID: ${{ inputs.scan_run_id }}
-          RUN_STARTED_AT: ${{ github.run_started_at }} # #330: whole-run wall time -> run_meta.total_ms
+          RUN_STARTED_AT: ${{ needs.scan.outputs.run-started-at }} # #330: whole-run wall time -> run_meta.total_ms
           MAX_ENVELOPE_BYTES: "4194304" # TODO(infra): 4 MiB. The whole POST body stays under this.
         run: |
           set -euo pipefail
