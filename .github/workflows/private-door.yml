@@ -104,7 +104,7 @@ jobs:
     steps:
       - name: Preflight (inputs are configured and safe)
         env:
-          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:ea08aa6675b5ffd4162f6562692f73ff1db5384e9d5b4d25aaedfdcda197d3fe
+          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:dd9d139f4fcbcae97fd4aa2e55be8e8eb467ec182527caad2cf06d871da64932
           LICENCE_URL: https://registry.settletop.com/api/github/licence
           LICENCE_AUDIENCE: https://licence.settletop.com
           SHARE: ${{ inputs.share }}
@@ -194,7 +194,7 @@ jobs:
       # One pinned digest for the whole job: the provenance-verify step and the run step below both use
       # it, so the image we attest is exactly the image we run. The engine-image.yml bump re-pins this
       # alongside the other copies in this file.
-      ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:ea08aa6675b5ffd4162f6562692f73ff1db5384e9d5b4d25aaedfdcda197d3fe
+      ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:dd9d139f4fcbcae97fd4aa2e55be8e8eb467ec182527caad2cf06d871da64932
     outputs:
       report-artifact-id: ${{ steps.upload.outputs.artifact-id }}
       share-file-sha256: ${{ steps.engine.outputs.share-file-sha256 }}
@@ -762,7 +762,7 @@ jobs:
       - name: Validate digest, size and schema
         id: validate
         env:
-          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:ea08aa6675b5ffd4162f6562692f73ff1db5384e9d5b4d25aaedfdcda197d3fe
+          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:dd9d139f4fcbcae97fd4aa2e55be8e8eb467ec182527caad2cf06d871da64932
           MAX_BYTES: ${{ inputs.max-share-bytes }}
           EXPECT_SHA256: ${{ needs.check.outputs.share-file-sha256 }}
           EXPECT_BYTES: ${{ needs.check.outputs.share-file-bytes }}
@@ -820,7 +820,7 @@ jobs:
       - name: Normalize scanner output into the tool envelope (best-effort)
         continue-on-error: true # a normalize failure must never block the core share upload
         env:
-          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:ea08aa6675b5ffd4162f6562692f73ff1db5384e9d5b4d25aaedfdcda197d3fe
+          ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:dd9d139f4fcbcae97fd4aa2e55be8e8eb467ec182527caad2cf06d871da64932
           REPOSITORY_ID: ${{ github.repository_id }}
           RUN_ID: ${{ github.run_id }}
         run: |
