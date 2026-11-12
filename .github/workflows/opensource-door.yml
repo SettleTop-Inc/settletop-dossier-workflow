@@ -45,6 +45,11 @@ env:
   ENGINE_MEMORY: 4g
   INGEST_AUDIENCE: https://ingest.settletop.com
   CALLBACK_URL: https://registry.settletop.com/api/ingest/opensource-scan
+  # Live-progress ping endpoint. The open-source run lives in the host repo, so GitHub's
+  # workflow_run webhook never reaches the scanned-repo scan_run row; these pings move the bar.
+  # Authorized by the single-use scan_run token in the body (repo/commit matched server-side),
+  # NOT OIDC: the result callback keeps full OIDC, so the hardened `scan` job needs no id-token.
+  PROGRESS_URL: https://registry.settletop.com/api/ingest/opensource-scan/progress
 
 defaults:
   run:
@@ -81,6 +86,19 @@ jobs:
           [[ "$INPUT_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || fail "repo must be owner/name"
           [[ "$INPUT_COMMIT" =~ ^[0-9a-f]{7,40}$ ]] || fail "commit must be a hex SHA"
 
+      - name: Progress cloning
+        env:
+          INPUT_REPO: ${{ inputs.repo }}
+          INPUT_COMMIT: ${{ inputs.commit }}
+          SCAN_RUN_ID: ${{ inputs.scan_run_id }}
+          PHASE: cloning
+        run: |
+          set -uo pipefail # best effort: a ping must NEVER fail a scan
+          jq -n --arg srid "$SCAN_RUN_ID" --arg repo "$INPUT_REPO" --arg commit "$INPUT_COMMIT" --arg phase "$PHASE" \
+            '{scan_run_id:$srid, subject:{repo:$repo, commit:$commit}, phase:$phase}' > progress.json
+          curl -sS --proto '=https' --tlsv1.2 --max-time 20 -X POST \
+            -H 'Content-Type: application/json' --data-binary @progress.json "$PROGRESS_URL" > /dev/null || true
+
       - name: Clone the public repo (tokenless) at the pinned commit
         env:
           INPUT_REPO: ${{ inputs.repo }}
@@ -107,6 +125,19 @@ jobs:
             --repo SettleTop-Inc/SettleTop-AI-Dossier \
             --signer-workflow SettleTop-Inc/SettleTop-AI-Dossier/.github/workflows/engine-image.yml
           echo "Engine image provenance verified: $ENGINE_IMAGE" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Progress analyzing
+        env:
+          INPUT_REPO: ${{ inputs.repo }}
+          INPUT_COMMIT: ${{ inputs.commit }}
+          SCAN_RUN_ID: ${{ inputs.scan_run_id }}
+          PHASE: analyzing
+        run: |
+          set -uo pipefail # best effort: a ping must NEVER fail a scan
+          jq -n --arg srid "$SCAN_RUN_ID" --arg repo "$INPUT_REPO" --arg commit "$INPUT_COMMIT" --arg phase "$PHASE" \
+            '{scan_run_id:$srid, subject:{repo:$repo, commit:$commit}, phase:$phase}' > progress.json
+          curl -sS --proto '=https' --tlsv1.2 --max-time 20 -X POST \
+            -H 'Content-Type: application/json' --data-binary @progress.json "$PROGRESS_URL" > /dev/null || true
 
       - name: Run the engine in a sandbox (pinned image, no network, read-only, non-root)
         env:
@@ -424,6 +455,19 @@ jobs:
     permissions:
       id-token: write # mint the OIDC token the callback verifies
     steps:
+      - name: Progress uploading
+        env:
+          INPUT_REPO: ${{ inputs.repo }}
+          INPUT_COMMIT: ${{ inputs.commit }}
+          SCAN_RUN_ID: ${{ inputs.scan_run_id }}
+          PHASE: uploading
+        run: |
+          set -uo pipefail # best effort: a ping must NEVER fail a scan
+          jq -n --arg srid "$SCAN_RUN_ID" --arg repo "$INPUT_REPO" --arg commit "$INPUT_COMMIT" --arg phase "$PHASE" \
+            '{scan_run_id:$srid, subject:{repo:$repo, commit:$commit}, phase:$phase}' > progress.json
+          curl -sS --proto '=https' --tlsv1.2 --max-time 20 -X POST \
+            -H 'Content-Type: application/json' --data-binary @progress.json "$PROGRESS_URL" > /dev/null || true
+
       - name: Download the report
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
