@@ -458,6 +458,73 @@ jobs:
           if-no-files-found: error # tools-zizmor.json is always written, so this never trips
 
   # ---------------------------------------------------------------------------
+  # tools-qscan (#364, epic #310). OSS post-quantum crypto scanner
+  # (@quantakrypto/qscan). Scans the source tree for quantum-vulnerable crypto and
+  # emits a SARIF report plus a CycloneDX 1.6 CBOM. PARALLEL to scan, soft-fails to
+  # `skipped` like tools-zizmor; `share` folds qscan.sarif + qscan.cbom.json into the
+  # tool envelope via the engine's --qscan-sarif / --qscan-cbom flags.
+  # ---------------------------------------------------------------------------
+  tools-qscan:
+    if: ${{ github.event.pull_request.head.repo.fork != true && inputs.share == 'registry' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # check out the commit to scan
+    env:
+      QSCAN_VERSION: "0.12.0" # TODO(infra): bump to the current @quantakrypto/qscan release
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 20
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "20"
+
+      - name: Scan for quantum-vulnerable crypto (SARIF + CBOM; soft-fail to `skipped`)
+        id: scan
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/out"; mkdir -p "$out"
+          status=skipped
+          # npx runs the version-pinned qscan ephemerally; npm's integrity sha512 content-pins the
+          # download. qscan exits non-zero when it FINDS vulnerable crypto - that is not a tool
+          # failure, so status is `ok` whenever a valid SARIF was written, else `skipped`.
+          npx -y "@quantakrypto/qscan@${QSCAN_VERSION}" . --format sarif -o "$out/qscan.sarif" \
+            > "$RUNNER_TEMP/qscan-sarif.log" 2>&1 || true
+          npx -y "@quantakrypto/qscan@${QSCAN_VERSION}" . --cbom -o "$out/qscan.cbom.json" \
+            > "$RUNNER_TEMP/qscan-cbom.log" 2>&1 || true
+          if python3 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("runs") is not None else 1)' \
+               "$out/qscan.sarif" 2>/dev/null; then
+            status=ok
+          else
+            rm -f "$out/qscan.sarif"
+          fi
+          # Keep the CBOM only when it parsed as a CycloneDX doc; drop it otherwise.
+          if ! python3 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("bomFormat")=="CycloneDX" else 1)' \
+               "$out/qscan.cbom.json" 2>/dev/null; then
+            rm -f "$out/qscan.cbom.json"
+          fi
+          python3 -I -c 'import json,sys; json.dump({"name":"qscan","version":sys.argv[1],"db_snapshot":"","status":sys.argv[2]}, open(sys.argv[3],"w"))' \
+            "$QSCAN_VERSION" "$status" "$out/tools-qscan.json"
+          echo "qscan $QSCAN_VERSION: status=$status" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pass the tool output on (1-day artifact)
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dossier-tools-qscan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/out
+          retention-days: 1
+          if-no-files-found: error # tools-qscan.json is always written, so this never trips
+
+  # ---------------------------------------------------------------------------
   # tools-trivy-sbom (#826, epic #823). Scans the ENGINE's Trivy-facing BOM for known
   # CVEs so every versioned component carries its advisories (canonical_key = the
   # component bom-ref = Trivy's PkgIdentifier.BOMRef). This is a DIFFERENT scan from
@@ -743,7 +810,7 @@ jobs:
   # ---------------------------------------------------------------------------
   share:
     if: ${{ !cancelled() && inputs.share == 'registry' && needs.check.result == 'success' }}
-    needs: [check, tools-trivy, tools-zizmor, tools-trivy-sbom]
+    needs: [check, tools-trivy, tools-zizmor, tools-trivy-sbom, tools-qscan]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -842,6 +909,7 @@ jobs:
           tv, tdb, ts = meta("tools-trivy.json", "trivy")
           zv, zdb, zs = meta("tools-zizmor.json", "zizmor")
           sv, sdb, ss = meta("tools-trivy-sbom.json", "trivy-sbom")  # AI-BOM CVE scan (#826)
+          qv, qdb, qs = meta("tools-qscan.json", "qscan")  # post-quantum crypto scan (#364)
           args = []
           if os.path.exists(os.path.join(t, "trivy.json")):
               args += ["--trivy-json", "/in/trivy.json"]
@@ -851,6 +919,11 @@ jobs:
               args += ["--trivy-sbom-json", "/in/trivy-sbom.json"]
           if os.path.exists(os.path.join(t, "zizmor.sarif")):
               args += ["--sarif", "/in/zizmor.sarif:zizmor"]
+          # qscan's post-quantum crypto findings (SARIF) and CBOM (CycloneDX 1.6).
+          if os.path.exists(os.path.join(t, "qscan.sarif")):
+              args += ["--qscan-sarif", "/in/qscan.sarif"]
+          if os.path.exists(os.path.join(t, "qscan.cbom.json")):
+              args += ["--qscan-cbom", "/in/qscan.cbom.json"]
           if os.path.exists(os.path.join(t, "findings.json")):
               args += ["--findings", "/in/findings.json"]
           db = tdb or sdb  # fs and sbom pull the same vuln-DB; use whichever ran
@@ -859,6 +932,7 @@ jobs:
           args += ["--tool", f"trivy:{tv}:{tdb}:{ts}"]
           args += ["--tool", f"zizmor:{zv}:{zdb}:{zs}"]
           args += ["--tool", f"trivy-sbom:{sv}:{sdb}:{ss}"]
+          args += ["--tool", f"qscan:{qv}:{qdb}:{qs}"]
           print("\n".join(args))
           PY
           mapfile -t NARGS < "$RUNNER_TEMP/nargs"
@@ -994,7 +1068,7 @@ jobs:
   # ---------------------------------------------------------------------------
   cleanup:
     if: always() && needs.licence.result != 'skipped'
-    needs: [licence, check, tools-trivy, tools-zizmor, tools-trivy-sbom, keep, keep-checks, keep-security-tab, keep-release, share]
+    needs: [licence, check, tools-trivy, tools-zizmor, tools-trivy-sbom, tools-qscan, keep, keep-checks, keep-security-tab, keep-release, share]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -1008,7 +1082,7 @@ jobs:
           IDS: >-
             ${{ needs.licence.outputs.artifact-id }} ${{ needs.check.outputs.report-artifact-id }}
             ${{ needs.tools-trivy.outputs.artifact-id }} ${{ needs.tools-zizmor.outputs.artifact-id }}
-            ${{ needs.tools-trivy-sbom.outputs.artifact-id }}
+            ${{ needs.tools-trivy-sbom.outputs.artifact-id }} ${{ needs.tools-qscan.outputs.artifact-id }}
         run: |
           set -uo pipefail
           for id in $IDS; do
