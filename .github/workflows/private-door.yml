@@ -972,10 +972,13 @@ jobs:
           echo "::add-mask::$oidc"
           # The bearer goes through curl's stdin config, not argv. Not --fail, so the body can be shown.
           # TODO(infra): confirm the registry honours Idempotency-Key (a retried run must not double-ingest).
+          # Gzip the body: a big repo's dossier exceeds the serverless request-body cap (~4.5MB) uncompressed.
+          # The ingest route reads Content-Encoding and inflates before parsing. TLS still encrypts the wire.
+          gzip -c envelope.json > envelope.json.gz
           status=$(printf 'header = "Authorization: Bearer %s"\n' "$oidc" | curl -K - -sS --proto '=https' \
             --tlsv1.2 --max-time 120 --retry 2 -X POST \
-            -H 'Content-Type: application/json' -H "Idempotency-Key: $IDEMPOTENCY_KEY" \
-            --data-binary @envelope.json -o response.json -w '%{http_code}' "$INGEST_URL")
+            -H 'Content-Type: application/json' -H 'Content-Encoding: gzip' -H "Idempotency-Key: $IDEMPOTENCY_KEY" \
+            --data-binary @envelope.json.gz -o response.json -w '%{http_code}' "$INGEST_URL")
           if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
             echo "::error::registry ingest returned HTTP $status: $(head -c 1000 response.json | tr -d '\r\n')"
             exit 1
