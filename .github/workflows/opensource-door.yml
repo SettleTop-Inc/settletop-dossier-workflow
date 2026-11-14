@@ -141,16 +141,38 @@ jobs:
 
       - name: Run the engine in a sandbox (pinned image, no network, read-only, non-root)
         env:
+          INPUT_REPO: ${{ inputs.repo }}
           INPUT_COMMIT: ${{ inputs.commit }}
+          SCAN_RUN_ID: ${{ inputs.scan_run_id }}
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/engine.log" # engine output stays on this runner, never the live log
           extra=(); [ -z "$ENGINE_COMMIT" ] || extra=(--engine-commit "$ENGINE_COMMIT")
           docker pull --quiet "$ENGINE_IMAGE" > /dev/null
+          cname="dossier-engine-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          # Heartbeat ticker (#318 pair, registry PR #1006): analyze is the long SILENT phase, so with no
+          # ping the reaper's no-heartbeat clock would fail a live run. While the engine CONTAINER is
+          # running, POST an `analyzing` ping (same body/url/token as the progress steps) every ~90s. Tied
+          # to the container, never a shell PID: a vanished/exited container stops the beats, so a dead
+          # engine is no longer masked; a true in-container hang keeps State.Running=true and is left to
+          # the job timeout / registry's 45-min ceiling. Best effort: a ping must NEVER fail the scan.
+          heartbeat() {
+            while true; do
+              sleep 90
+              [ "$(docker inspect -f '{{.State.Running}}' "$cname" 2>/dev/null)" = "true" ] || continue
+              jq -n --arg srid "$SCAN_RUN_ID" --arg repo "$INPUT_REPO" --arg commit "$INPUT_COMMIT" \
+                '{scan_run_id:$srid, subject:{repo:$repo, commit:$commit}, phase:"analyzing"}' > "$RUNNER_TEMP/hb.json"
+              curl -sS --proto '=https' --tlsv1.2 --max-time 20 --retry 2 -X POST \
+                -H 'Content-Type: application/json' --data-binary @"$RUNNER_TEMP/hb.json" "$PROGRESS_URL" > /dev/null || true
+            done
+          }
+          heartbeat & hb_pid=$!
+          trap 'kill "$hb_pid" 2>/dev/null || true' EXIT # the ticker can never outlive this step
           # Sandbox (same shape as the private door): no network, the runner user (so git trusts the mount),
           # read-only root, no-new-privileges, tmpfs /tmp, all capabilities dropped, memory + pid limits.
           set +e
           docker run --rm \
+            --name "$cname" \
             --network none \
             --user "$(id -u):$(id -g)" \
             --read-only \
