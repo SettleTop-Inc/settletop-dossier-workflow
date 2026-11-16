@@ -1,0 +1,226 @@
+# Shared engine run for BOTH doors (spec 2026-11-16-one-scan-path.md §4.1, plan task 2.1).
+#
+# Runs as steps INSIDE the calling job (private `check`, opensource `scan`), so it shares that
+# job's disk (reads the tree the job already fetched) and does NOT change job_workflow_ref. It
+# does two things, once, for both doors:
+#   1. verify the engine image's build provenance (same signer identity on both doors), then
+#   2. run the pinned engine image in the shared sandbox with the shared `scan` flags, and write
+#      door-timing.json (the door's measured fetch wall + this step's pull + scan walls).
+#
+# A composite action does NOT inherit the job's `env:` map, so every infra value (image, memory;
+# the signer is the one security constant that is hardcoded) arrives as an input and is set on the
+# step via `env:`. Runner-provided vars (RUNNER_TEMP, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT,
+# GITHUB_OUTPUT, GITHUB_STEP_SUMMARY, ACTIONS_*) are visible without being passed.
+#
+# The scan `--image-digest` is DERIVED from engine_image (${ENGINE_IMAGE##*@}), exactly as both
+# live doors do, so there is no separate digest input to pass the wrong value into and move
+# facts_sha256.
+#
+# Door-specific, NOT here (stays authored in each door): the source fetch (checkout vs tokenless
+# clone), the licence job, keep/cleanup/fork-guard (private), the progress pings + the
+# container-name heartbeat ticker (opensource), and `permissions`. The calling job MUST grant
+# `packages: read` (the provenance verify reads the image's attestation from GHCR).
+name: Run the dossier engine
+description: >-
+  Verify the pinned engine image's provenance and run it in the shared sandbox over an
+  already-fetched tree, writing the share view, BOM, SARIF, findings, HTML and door-timing.json.
+
+inputs:
+  engine_image:
+    description: The sha256-pinned engine image. Fixed in the door, never a workflow_call input.
+    required: true
+  engine_memory:
+    description: Container memory cap (== memory-swap). Fixed in the door (4g today).
+    required: true
+  engine_commit:
+    description: Engine source commit for run_meta; empty records "Unknown" (both doors pass empty today).
+    required: false
+    default: ""
+  source_dir:
+    description: >-
+      The already-fetched tree on the job disk. Mounted read-only at /work/<basename>; the basename
+      is load-bearing (the engine names the subject after it), so pass a workspace whose basename is
+      the repo name (private: github.workspace) or a clone dir named `src` (opensource), keeping
+      today's /work/<repo> and /work/src and so facts_sha256 does not move.
+    required: true
+  commit:
+    description: The commit SHA for `scan --commit`. Opensource passes the pinned input; private reads `git rev-parse HEAD` in a door step and passes it.
+    required: true
+  require_licence:
+    description: "'true' forces --require-licence (private); the licence is fed on stdin and a missing one is a hard fail."
+    required: false
+    default: "false"
+  licence_path:
+    description: Path to the licence file (private only; read on the engine's stdin). Required when require_licence is true.
+    required: false
+    default: ""
+  repository_id:
+    description: github.repository_id for `scan --repository-id` (private only, with the licence).
+    required: false
+    default: ""
+  run_id:
+    description: github.run_id for `scan --run-id` (private only, with the licence).
+    required: false
+    default: ""
+  fetch_ms:
+    description: The wall time the door measured fetching the tree (clone or checkout), in ms. 0/unset means not measured and the fetch key is omitted from door-timing.json (never fabricated).
+    required: false
+    default: "0"
+  fetch_kind:
+    description: "'clone' (opensource) or 'setup' (private) -- selects the door-timing.json fetch key (clone_ms vs setup_ms)."
+    required: true
+  gh_token:
+    description: A GITHUB_TOKEN for `gh attestation verify` (needs the job's packages:read). Pass ${{ github.token }}.
+    required: true
+
+outputs:
+  share-file-sha256:
+    description: sha256 of share.json (the private door validates the share view against this).
+    value: ${{ steps.engine.outputs.share-file-sha256 }}
+  share-file-bytes:
+    description: Byte length of share.json.
+    value: ${{ steps.engine.outputs.share-file-bytes }}
+  commit-sha:
+    description: The commit the engine scanned (echoed back for the private door's job output).
+    value: ${{ steps.engine.outputs.commit-sha }}
+  out-dir:
+    description: The output directory holding share.json/bom/sarif/findings/html/door-timing.json, for the door's upload step.
+    value: ${{ steps.engine.outputs.out-dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Verify the engine image's build provenance
+      # Reject any engine image not built by our signer workflow BEFORE it runs (issue #298).
+      # --bundle-from-oci reads the attestation from the PUBLIC image in GHCR, so this works from a
+      # customer runner with no access to our private repo. The signer identity is hardcoded here (NOT
+      # an input): it is identical for both doors and must not be door-tunable. Checks the SAME
+      # $ENGINE_IMAGE digest the run step pulls, so the two cannot drift.
+      shell: bash
+      env:
+        ENGINE_IMAGE: ${{ inputs.engine_image }}
+        GH_TOKEN: ${{ inputs.gh_token }}
+      run: |
+        set -euo pipefail
+        gh attestation verify "oci://$ENGINE_IMAGE" \
+          --bundle-from-oci \
+          --repo SettleTop-Inc/SettleTop-AI-Dossier \
+          --signer-workflow SettleTop-Inc/SettleTop-AI-Dossier/.github/workflows/engine-image.yml
+        echo "Engine image provenance verified: $ENGINE_IMAGE" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Run the engine in a sandbox (pinned image, no network, read-only, non-root)
+      id: engine
+      shell: bash
+      env:
+        ENGINE_IMAGE: ${{ inputs.engine_image }}
+        ENGINE_MEMORY: ${{ inputs.engine_memory }}
+        ENGINE_COMMIT: ${{ inputs.engine_commit }}
+        SOURCE_DIR: ${{ inputs.source_dir }}
+        COMMIT: ${{ inputs.commit }}
+        REQUIRE_LICENCE: ${{ inputs.require_licence }}
+        LICENCE_PATH: ${{ inputs.licence_path }}
+        REPOSITORY_ID: ${{ inputs.repository_id }}
+        RUN_ID: ${{ inputs.run_id }}
+        FETCH_MS: ${{ inputs.fetch_ms }}
+        FETCH_KIND: ${{ inputs.fetch_kind }}
+      run: |
+        set -euo pipefail
+
+        case "$FETCH_KIND" in
+          clone) fetch_key=clone_ms ;;
+          setup) fetch_key=setup_ms ;;
+          *) echo "::error::fetch_kind must be 'clone' or 'setup'"; exit 1 ;;
+        esac
+
+        out="$RUNNER_TEMP/out"; mkdir -p "$out"
+        log="$RUNNER_TEMP/engine.log" # engine output stays on this runner, never the live log
+        # The scanned --image-digest is derived from the image ref, exactly as both live doors do.
+        image_digest="${ENGINE_IMAGE##*@}"
+        # The internal mount basename is load-bearing: the engine names the subject after the
+        # directory. Private passes a workspace whose basename is the repo name; opensource passes a
+        # clone dir named `src`, keeping today's /work/src (so facts_sha256 does not move).
+        src_abs="$(cd "$SOURCE_DIR" && pwd)"
+        src_name="$(basename "$src_abs")"
+
+        extra=(); [ -z "$ENGINE_COMMIT" ] || extra=(--engine-commit "$ENGINE_COMMIT")
+
+        t_pull=$(date +%s%3N) # #382 engine pull + run walls (best-effort, envelope-only timing)
+        docker pull --quiet "$ENGINE_IMAGE" > /dev/null
+        t_run=$(date +%s%3N)
+        # Deterministic container name, derivable by the door from the same runner vars, so the
+        # opensource door's heartbeat ticker (door-authored) can `docker inspect` this container.
+        cname="dossier-engine-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+        # Sandbox: no network, the runner user (so git trusts the mount), read-only root,
+        # no-new-privileges, tmpfs /tmp, all capabilities dropped, memory + pid limits. Identical on
+        # both doors except the licence: private adds -i, --require-licence/--repository-id/--run-id,
+        # and feeds the licence on stdin.
+        run_args=(run --rm)
+        [ "$REQUIRE_LICENCE" = "true" ] && run_args+=(-i)
+        run_args+=(
+          --name "$cname"
+          --network none
+          --user "$(id -u):$(id -g)"
+          --read-only
+          --tmpfs /tmp:rw,noexec,nosuid,size=512m
+          --cap-drop ALL
+          --security-opt no-new-privileges
+          --memory "$ENGINE_MEMORY" --memory-swap "$ENGINE_MEMORY"
+          --pids-limit 256
+          -e HOME=/tmp -e GIT_CONFIG_NOSYSTEM=1
+          -v "$src_abs:/work/$src_name:ro"
+          -v "$out:/out"
+          "$ENGINE_IMAGE"
+          scan --path "/work/$src_name" --commit "$COMMIT"
+            --image-digest "$image_digest"
+            --include-hidden
+            --share-out /out/share.json
+            --bom-out /out/bom.cdx.json
+            --trivy-bom-out /out/bom.trivy.cdx.json
+            --sarif-out /out/results.sarif
+            --findings-out /out/findings.json
+            --html-out /out/summary.html
+        )
+        if [ "$REQUIRE_LICENCE" = "true" ]; then
+          [ -s "$LICENCE_PATH" ] || { echo "::error::require_licence is true but no licence at '$LICENCE_PATH'"; exit 1; }
+          run_args+=(--require-licence --repository-id "$REPOSITORY_ID" --run-id "$RUN_ID")
+        fi
+        run_args+=("${extra[@]}")
+
+        set +e
+        if [ "$REQUIRE_LICENCE" = "true" ]; then
+          docker "${run_args[@]}" < "$LICENCE_PATH" > "$log" 2>&1
+        else
+          docker "${run_args[@]}" > "$log" 2>&1
+        fi
+        status=$?
+        set -e
+        t_end=$(date +%s%3N) # #382 engine docker-run wall
+        [ "$REQUIRE_LICENCE" = "true" ] && rm -f "$LICENCE_PATH" || true
+
+        if [ "$status" -ne 0 ]; then
+          echo "::error::the engine exited with status $status (its log stays on the runner and is not printed)"
+          exit 1
+        fi
+        for f in share.json bom.cdx.json results.sarif findings.json summary.html; do
+          [ -s "$out/$f" ] || { echo "::error::the engine did not write $f"; exit 1; }
+        done
+
+        # #382 per-step walls for the scan-time breakdown, carried in the report artifact. Best-effort
+        # and envelope-only: a write failure here must never fail the scan, and this never touches
+        # share.json or any hash. pull_ms and scan_wall_ms are always measured here. The door's fetch
+        # wall is stamped ONLY when it is a real positive measurement (spec invariant 10: a step is
+        # never zero-filled). fetch_ms<=0 means the door did not measure it, so the key is omitted.
+        fetch_pair=""
+        if [ "${FETCH_MS:-0}" -gt 0 ] 2>/dev/null; then
+          fetch_pair="\"$fetch_key\":${FETCH_MS},"
+        fi
+        printf '{%s"pull_ms":%s,"scan_wall_ms":%s}' \
+          "$fetch_pair" "$(( t_run - t_pull ))" "$(( t_end - t_run ))" > "$out/door-timing.json" || true
+
+        {
+          echo "share-file-sha256=$(sha256sum "$out/share.json" | cut -d' ' -f1)"
+          echo "share-file-bytes=$(wc -c < "$out/share.json" | tr -d ' ')"
+          echo "commit-sha=$COMMIT"
+          echo "out-dir=$out"
+        } >> "$GITHUB_OUTPUT"

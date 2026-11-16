@@ -1,0 +1,172 @@
+# Smoke CI for the three shared composite actions (plan task 2.1 proof, before any door is refit).
+#
+# It proves the action files PARSE and WIRE without the licensed engine, a licence, or OIDC:
+#   - actionlint lints every workflow AND type-checks the local `uses: ./.github/actions/*` calls
+#     (required-input coverage) in the `wiring` job below, which never runs (its `if` never matches).
+#   - a structural self-check asserts each action is a composite and every `run` step sets shell.
+#   - run-tool is exercised end-to-end on the one tokenless scanner (zizmor over a sample workflow),
+#     proving the composite step mechanics (per-step env, soft-fail, ms stamping, artifact write).
+#
+# run-engine and build-and-post are NOT executed here: they need the engine image, a licence and an
+# OIDC mint. The `wiring` job type-checks their calls at lint time without running them.
+name: Action smoke
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      ACTIONLINT_VERSION: "1.7.7"
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"
+          base="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
+          tgz="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$RUNNER_TEMP/$tgz" "$base/$tgz"
+          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$RUNNER_TEMP/actionlint_checksums.txt" \
+            "$base/actionlint_${ACTIONLINT_VERSION}_checksums.txt"
+          ( cd "$RUNNER_TEMP" && grep " $tgz\$" actionlint_checksums.txt | sha256sum -c - )
+          tar -xzf "$RUNNER_TEMP/$tgz" -C "$bin" actionlint
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: actionlint (workflows + local action input wiring)
+        run: actionlint -color
+
+      - name: Structural self-check of the three action.yml files
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import sys, yaml  # PyYAML ships on ubuntu-latest runners
+          actions = [
+              ".github/actions/run-engine/action.yml",
+              ".github/actions/run-tool/action.yml",
+              ".github/actions/build-and-post/action.yml",
+          ]
+          bad = []
+          for path in actions:
+              doc = yaml.safe_load(open(path, encoding="utf-8"))
+              runs = doc.get("runs", {})
+              if runs.get("using") != "composite":
+                  bad.append(f"{path}: runs.using is {runs.get('using')!r}, expected 'composite'")
+              for i, step in enumerate(runs.get("steps", [])):
+                  if "run" in step and step.get("shell") != "bash":
+                      bad.append(f"{path}: step {i} ({step.get('name','?')}) has a run block without shell: bash")
+          if bad:
+              print("\n".join(f"::error::{m}" for m in bad))
+              sys.exit(1)
+          print(f"OK: {len(actions)} composite actions, every run step sets shell: bash")
+          PY
+
+  run-tool-zizmor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # zizmor's online audits use github.token; the scan soft-fails if the API is unreachable
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Seed a sample workflow for zizmor to scan
+        run: |
+          set -euo pipefail
+          mkdir -p sample/.github/workflows
+          cat > sample/.github/workflows/sample.yml <<'YML'
+          name: sample
+          on: push
+          permissions: {}
+          jobs:
+            noop:
+              runs-on: ubuntu-latest
+              steps:
+                - run: echo hello
+                  shell: bash
+          YML
+
+      - name: Run run-tool (zizmor) over the sample
+        uses: ./.github/actions/run-tool
+        with:
+          tool: zizmor
+          source_dir: sample
+          trivy_version: "0.76.2"
+          zizmor_version: "1.32.0"
+          qscan_version: "0.12.0"
+
+      - name: Assert run-tool wrote a valid tools-zizmor.json
+        run: |
+          set -euo pipefail
+          f="$RUNNER_TEMP/out/tools-zizmor.json"
+          [ -s "$f" ] || { echo "::error::run-tool did not write $f"; exit 1; }
+          python3 -I - "$f" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert d.get("name") == "zizmor", d
+          assert d.get("status") in ("ok", "skipped"), d
+          assert isinstance(d.get("ms"), int) and d["ms"] >= 0, d  # ms is stamped and measured
+          print(f"OK: zizmor status={d['status']} ms={d['ms']}")
+          PY
+
+  # Lint-only wiring proof for run-engine + build-and-post. This job NEVER runs: no commit SHA equals
+  # the sentinel. It exists so actionlint type-checks that every required input of those two actions is
+  # supplied by a real call, without needing the engine image, a licence, or an OIDC mint.
+  wiring:
+    if: ${{ github.sha == 'lint-only-never-runs' }}
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+      id-token: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: run-engine wiring (private-shaped call)
+        uses: ./.github/actions/run-engine
+        with:
+          engine_image: ghcr.io/settletop-inc/dossier-engine@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          engine_memory: 4g
+          source_dir: ${{ github.workspace }}
+          commit: ${{ github.sha }}
+          require_licence: "true"
+          licence_path: ${{ runner.temp }}/licence/licence.txt
+          repository_id: ${{ github.repository_id }}
+          run_id: ${{ github.run_id }}
+          fetch_ms: "0"
+          fetch_kind: setup
+          gh_token: ${{ github.token }}
+
+      - name: build-and-post wiring (private-shaped call)
+        uses: ./.github/actions/build-and-post
+        with:
+          door: private
+          callback_url: https://registry.settletop.com/api/ingest/scan
+          audience: https://ingest.settletop.com
+          engine_image: ghcr.io/settletop-inc/dossier-engine@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          report_artifact_id: "0"
+          tools_artifact_pattern: dossier-tools-*-${{ github.run_id }}-${{ github.run_attempt }}
+          subject_json: "{}"
+          run_started_at: "1970-01-01T00:00:00.000Z"
+          max_envelope_bytes: "4194304"
+          idempotency_key: ${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}

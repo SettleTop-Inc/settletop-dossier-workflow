@@ -1,0 +1,236 @@
+# Shared composite action: run ONE OSS scanner (spec 2026-11-16-one-scan-path §4.1, plan task 2.1).
+#
+# Both doors duplicated four near-identical tool jobs (trivy fs, zizmor, qscan, trivy-sbom). This action
+# holds the single copy of each tool's install + scan. A job in either door does its OWN source fetch
+# (checkout or tokenless clone) and its OWN upload-artifact, and calls this action in between with
+# `tool:` set to which scanner to run. Every tool SOFT-FAILS to status `skipped` (a blocked download, a
+# crash, no workflows) and writes $RUNNER_TEMP/out/tools-<tool>.json with name/version/db_snapshot/
+# status/ms, which build-and-post folds into the tool envelope via the engine's `normalize`.
+#
+# Unification note: the private door's tool JSONs carried no `ms` today (only the opensource door timed
+# the tools). This action ALWAYS stamps `ms`, so both doors now populate trivy_ms/zizmor_ms/qscan_ms/
+# trivy_sbom_ms (spec req 2). `ms` is a measured wall delta and db_snapshot is "" when no DB was pulled;
+# nothing is fabricated.
+#
+# Composite-action constraints honored here: every step sets `shell: bash`; every value a step reads is
+# set on that step's own `env:` from an input or a runner var ($RUNNER_TEMP / $GITHUB_* -- a composite
+# action does NOT inherit the job's `env:` map). Tool versions are INPUTS the door supplies (never
+# hardcoded here, never a workflow_call input the customer controls); the current pinned values are
+# documented on each input. The scan TARGET dir differs by door (private checks out to `.`, opensource
+# clones into `clone/`), so it is the `source_dir` input; trivy-sbom instead reads the engine BOM at
+# `bom_path` (the door's own download-artifact step fetches it first). The scanner invocations and the
+# checksum-verified Trivy install are preserved exactly; only the target path is parameterized.
+name: Run one OSS scanner
+description: Install and run a single OSS scanner (trivy | zizmor | qscan | trivy-sbom), soft-failing to `skipped`.
+
+inputs:
+  tool:
+    description: Which scanner to run - one of trivy | zizmor | qscan | trivy-sbom.
+    required: true
+  source_dir:
+    description: >-
+      Directory to scan for trivy / zizmor / qscan (the door's fetched tree): `.` for the private
+      checkout, `clone` for the opensource tokenless clone. Unused by trivy-sbom.
+    required: false
+    default: "."
+  bom_path:
+    description: >-
+      trivy-sbom only - the engine's CycloneDX 1.6 Trivy-facing BOM (from --trivy-bom-out). The door
+      downloads the report artifact to this path before calling the action.
+    required: false
+    default: report/bom.trivy.cdx.json
+  trivy_version:
+    description: Pinned Trivy release for `trivy` and `trivy-sbom` (current pinned value 0.76.2). The door supplies it.
+    required: true
+  zizmor_version:
+    description: Pinned zizmor release for `zizmor` (current pinned value 1.32.0). The door supplies it.
+    required: true
+  qscan_version:
+    description: Pinned @quantakrypto/qscan release for `qscan` (current pinned value 0.12.0). The door supplies it.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Validate the tool input
+      shell: bash
+      env:
+        TOOL: ${{ inputs.tool }}
+      run: |
+        set -euo pipefail
+        case "$TOOL" in
+          trivy|zizmor|qscan|trivy-sbom) ;;
+          *) echo "::error::run-tool: unknown tool '$TOOL' (expected trivy|zizmor|qscan|trivy-sbom)"; exit 1 ;;
+        esac
+
+    # Trivy binary, shared by `trivy` (source scan) and `trivy-sbom` (BOM CVE scan). Checksum-verified
+    # against the release's own checksums.txt. A blocked download soft-fails here (continue-on-error);
+    # the scan step then records `skipped` because `trivy` is not on PATH.
+    - name: Install Trivy (pinned, checksum-verified)
+      if: ${{ inputs.tool == 'trivy' || inputs.tool == 'trivy-sbom' }}
+      shell: bash
+      continue-on-error: true
+      env:
+        TRIVY_VERSION: ${{ inputs.trivy_version }}
+      run: |
+        set -euo pipefail
+        bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"
+        base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+        tgz="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+        curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$RUNNER_TEMP/$tgz" "$base/$tgz"
+        curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$RUNNER_TEMP/trivy_checksums.txt" \
+          "$base/trivy_${TRIVY_VERSION}_checksums.txt"
+        ( cd "$RUNNER_TEMP" && grep " $tgz\$" trivy_checksums.txt | sha256sum -c - )
+        tar -xzf "$RUNNER_TEMP/$tgz" -C "$bin" trivy
+        echo "$bin" >> "$GITHUB_PATH"
+
+    - name: Set up Node 20
+      if: ${{ inputs.tool == 'qscan' }}
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: "20"
+
+    - name: "Trivy: scan the tree (fs vuln + misconfig; soft-fail to skipped)"
+      if: ${{ inputs.tool == 'trivy' }}
+      shell: bash
+      continue-on-error: true
+      env:
+        TRIVY_VERSION: ${{ inputs.trivy_version }}
+        SOURCE_DIR: ${{ inputs.source_dir }}
+        TRIVY_USERNAME: ${{ github.actor }}
+        TRIVY_PASSWORD: ${{ github.token }} # authed ghcr.io/aquasecurity/trivy-db pull (dodge the anon rate limit)
+      run: |
+        set -uo pipefail
+        t0=$(date +%s%3N) # #382 tool scan wall (parallel to the engine)
+        out="$RUNNER_TEMP/out"; mkdir -p "$out"
+        cache="$RUNNER_TEMP/trivy-cache"
+        status=skipped; db_snapshot=""
+        if command -v trivy > /dev/null; then
+          # 1. Pull the vuln-DB once (authed). A blocked/rate-limited pull soft-fails the whole job.
+          if trivy fs --download-db-only --cache-dir "$cache" --timeout 5m 2> "$RUNNER_TEMP/trivy-db.log"; then
+            db_snapshot="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["UpdatedAt"][:10])' \
+              "$cache/db/metadata.json" 2>/dev/null || true)"
+            # 2. Scan: vulnerabilities + misconfigurations only, secret scanner OFF, no DB update
+            #    (step 1 cached it). A non-zero exit here means findings, not a tool failure.
+            if trivy fs --scanners vuln,misconfig --format json --skip-db-update \
+                 --cache-dir "$cache" --timeout 10m --output "$out/trivy.json" "$SOURCE_DIR" 2> "$RUNNER_TEMP/trivy-scan.log" \
+               && [ -s "$out/trivy.json" ]; then
+              status=ok
+            else
+              rm -f "$out/trivy.json"
+            fi
+          else
+            echo "::warning::Trivy vuln-DB pull failed; status=skipped (dossier unaffected)"
+          fi
+        else
+          echo "::warning::Trivy is not installed (download failed); status=skipped"
+        fi
+        python3 -I -c 'import json,sys; json.dump({"name":"trivy","version":sys.argv[1],"db_snapshot":sys.argv[2],"status":sys.argv[3],"ms":int(sys.argv[5])}, open(sys.argv[4],"w"))' \
+          "$TRIVY_VERSION" "$db_snapshot" "$status" "$out/tools-trivy.json" "$(( $(date +%s%3N) - t0 ))"
+        echo "Trivy $TRIVY_VERSION: status=$status db_snapshot=${db_snapshot:-none}" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: "zizmor: scan the workflows (SARIF; soft-fail to skipped)"
+      if: ${{ inputs.tool == 'zizmor' }}
+      shell: bash
+      continue-on-error: true
+      env:
+        ZIZMOR_VERSION: ${{ inputs.zizmor_version }}
+        SOURCE_DIR: ${{ inputs.source_dir }}
+        GH_TOKEN: ${{ github.token }} # zizmor's online audits query the GitHub API
+      run: |
+        set -uo pipefail
+        t0=$(date +%s%3N) # #382 tool scan wall (parallel to the engine)
+        out="$RUNNER_TEMP/out"; mkdir -p "$out"
+        status=skipped
+        if [ -d "$SOURCE_DIR/.github/workflows" ]; then
+          # pipx runs the pinned zizmor ephemerally (PyPI wheel; no Python-env leakage). zizmor
+          # exits non-zero when it FINDS issues - that is not a tool failure, so status is `ok`
+          # whenever a valid SARIF was written, else `skipped` (crash / pipx missing).
+          pipx run "zizmor==${ZIZMOR_VERSION}" --format sarif "$SOURCE_DIR/.github/workflows" \
+            > "$out/zizmor.sarif" 2> "$RUNNER_TEMP/zizmor.log" || true
+          if python3 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("runs") is not None else 1)' \
+               "$out/zizmor.sarif" 2>/dev/null; then
+            status=ok
+          else
+            rm -f "$out/zizmor.sarif"
+          fi
+        else
+          echo "::notice::no .github/workflows to scan; zizmor status=skipped"
+        fi
+        python3 -I -c 'import json,sys; json.dump({"name":"zizmor","version":sys.argv[1],"db_snapshot":"","status":sys.argv[2],"ms":int(sys.argv[4])}, open(sys.argv[3],"w"))' \
+          "$ZIZMOR_VERSION" "$status" "$out/tools-zizmor.json" "$(( $(date +%s%3N) - t0 ))"
+        echo "zizmor $ZIZMOR_VERSION: status=$status" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: "qscan: scan for quantum-vulnerable crypto (SARIF + CBOM; soft-fail to skipped)"
+      if: ${{ inputs.tool == 'qscan' }}
+      shell: bash
+      continue-on-error: true
+      env:
+        QSCAN_VERSION: ${{ inputs.qscan_version }}
+        SOURCE_DIR: ${{ inputs.source_dir }}
+      run: |
+        set -uo pipefail
+        t0=$(date +%s%3N) # #382 tool scan wall (parallel to the engine)
+        out="$RUNNER_TEMP/out"; mkdir -p "$out"
+        status=skipped
+        # npx runs the version-pinned qscan ephemerally; npm's integrity sha512 content-pins the
+        # download. qscan exits non-zero when it FINDS vulnerable crypto - that is not a tool
+        # failure, so status is `ok` whenever a valid SARIF was written, else `skipped`.
+        npx -y "@quantakrypto/qscan@${QSCAN_VERSION}" "$SOURCE_DIR" --format sarif -o "$out/qscan.sarif" \
+          > "$RUNNER_TEMP/qscan-sarif.log" 2>&1 || true
+        npx -y "@quantakrypto/qscan@${QSCAN_VERSION}" "$SOURCE_DIR" --cbom -o "$out/qscan.cbom.json" \
+          > "$RUNNER_TEMP/qscan-cbom.log" 2>&1 || true
+        if python3 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("runs") is not None else 1)' \
+             "$out/qscan.sarif" 2>/dev/null; then
+          status=ok
+        else
+          rm -f "$out/qscan.sarif"
+        fi
+        # Keep the CBOM only when it parsed as a CycloneDX doc; drop it otherwise.
+        if ! python3 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("bomFormat")=="CycloneDX" else 1)' \
+             "$out/qscan.cbom.json" 2>/dev/null; then
+          rm -f "$out/qscan.cbom.json"
+        fi
+        python3 -I -c 'import json,sys; json.dump({"name":"qscan","version":sys.argv[1],"db_snapshot":"","status":sys.argv[2],"ms":int(sys.argv[4])}, open(sys.argv[3],"w"))' \
+          "$QSCAN_VERSION" "$status" "$out/tools-qscan.json" "$(( $(date +%s%3N) - t0 ))"
+        echo "qscan $QSCAN_VERSION: status=$status" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: "trivy-sbom: scan the engine BOM for CVEs (soft-fail to skipped)"
+      if: ${{ inputs.tool == 'trivy-sbom' }}
+      shell: bash
+      continue-on-error: true
+      env:
+        TRIVY_VERSION: ${{ inputs.trivy_version }}
+        BOM_PATH: ${{ inputs.bom_path }}
+        TRIVY_USERNAME: ${{ github.actor }}
+        TRIVY_PASSWORD: ${{ github.token }} # authed ghcr.io/aquasecurity/trivy-db pull
+      run: |
+        set -uo pipefail
+        t0=$(date +%s%3N) # #382 tool scan wall (runs after the engine, beside the upload)
+        out="$RUNNER_TEMP/out"; mkdir -p "$out"
+        cache="$RUNNER_TEMP/trivy-cache"
+        bom="$BOM_PATH" # the engine's 1.6 Trivy-facing BOM, not the 1.7 AI-BOM
+        status=skipped; db_snapshot=""
+        if command -v trivy > /dev/null && [ -s "$bom" ]; then
+          if trivy sbom --download-db-only --cache-dir "$cache" --timeout 5m 2> "$RUNNER_TEMP/trivy-db.log"; then
+            db_snapshot="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["UpdatedAt"][:10])' \
+              "$cache/db/metadata.json" 2>/dev/null || true)"
+            # Each vuln carries PkgIdentifier.BOMRef (the component bom-ref); normalize reads it as canonical_key.
+            if trivy sbom --format json --scanners vuln --skip-db-update \
+                 --cache-dir "$cache" --timeout 10m --output "$out/trivy-sbom.json" "$bom" 2> "$RUNNER_TEMP/trivy-sbom.log" \
+               && [ -s "$out/trivy-sbom.json" ]; then
+              status=ok
+            else
+              rm -f "$out/trivy-sbom.json"
+            fi
+          else
+            echo "::warning::Trivy vuln-DB pull failed; status=skipped (dossier unaffected)"
+          fi
+        elif [ ! -s "$bom" ]; then
+          echo "::warning::no bom.trivy.cdx.json in the report; trivy-sbom status=skipped"
+        else
+          echo "::warning::Trivy is not installed (download failed); status=skipped"
+        fi
+        python3 -I -c 'import json,sys; json.dump({"name":"trivy-sbom","version":sys.argv[1],"db_snapshot":sys.argv[2],"status":sys.argv[3],"ms":int(sys.argv[5])}, open(sys.argv[4],"w"))' \
+          "$TRIVY_VERSION" "$db_snapshot" "$status" "$out/tools-trivy-sbom.json" "$(( $(date +%s%3N) - t0 ))"
+        echo "Trivy SBOM $TRIVY_VERSION: status=$status db_snapshot=${db_snapshot:-none}" >> "$GITHUB_STEP_SUMMARY"
