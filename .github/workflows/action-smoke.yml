@@ -71,6 +71,16 @@ jobs:
               for i, step in enumerate(runs.get("steps", [])):
                   if "run" in step and step.get("shell") != "bash":
                       bad.append(f"{path}: step {i} ({step.get('name','?')}) has a run block without shell: bash")
+              # GitHub evaluates template expressions in action input metadata (description/default) at
+              # load time, where most contexts (github, secrets, ...) are unavailable, so the action fails
+              # to load. The smoke jobs never load run-engine/build-and-post, so only this static check
+              # catches it. The marker is built from parts so this workflow's own run body has no token.
+              expr = "$" + "{{"
+              for name, spec in (doc.get("inputs") or {}).items():
+                  for field in ("description", "default"):
+                      val = spec.get(field)
+                      if isinstance(val, str) and expr in val:
+                          bad.append(f"{path}: input '{name}' {field} has a template expression; move it out of metadata (GitHub evaluates it at load and the action fails to load)")
           if bad:
               print("\n".join(f"::error::{m}" for m in bad))
               sys.exit(1)
