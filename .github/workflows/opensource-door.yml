@@ -174,7 +174,7 @@ jobs:
 
       - name: Run the engine (verify provenance + pinned sandbox scan)
         id: engine
-        uses: ./.github/actions/run-engine
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-engine@fcb2b6d5dea5682d6d639b1d118681a67bc534fb
         with:
           engine_image: ${{ env.ENGINE_IMAGE }}
           engine_memory: ${{ env.ENGINE_MEMORY }}
@@ -232,7 +232,7 @@ jobs:
           git -C clone checkout -q FETCH_HEAD
 
       - name: Run Trivy (fs vuln + misconfig; soft-fail to skipped)
-        uses: ./.github/actions/run-tool
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@fcb2b6d5dea5682d6d639b1d118681a67bc534fb
         with:
           tool: trivy
           source_dir: clone
@@ -279,7 +279,7 @@ jobs:
           git -C clone checkout -q FETCH_HEAD
 
       - name: Run zizmor (workflow SARIF; soft-fail to skipped)
-        uses: ./.github/actions/run-tool
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@fcb2b6d5dea5682d6d639b1d118681a67bc534fb
         with:
           tool: zizmor
           source_dir: clone
@@ -326,7 +326,7 @@ jobs:
           git -C clone checkout -q FETCH_HEAD
 
       - name: Run qscan (post-quantum crypto SARIF + CBOM; soft-fail to skipped)
-        uses: ./.github/actions/run-tool
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@fcb2b6d5dea5682d6d639b1d118681a67bc534fb
         with:
           tool: qscan
           source_dir: clone
@@ -372,7 +372,7 @@ jobs:
           merge-multiple: true
 
       - name: Run Trivy on the engine BOM (CVEs; soft-fail to skipped)
-        uses: ./.github/actions/run-tool
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@fcb2b6d5dea5682d6d639b1d118681a67bc534fb
         with:
           tool: trivy-sbom
           bom_path: report/bom.trivy.cdx.json
@@ -418,7 +418,7 @@ jobs:
             -H 'Content-Type: application/json' --data-binary @progress.json "$PROGRESS_URL" > /dev/null || true
 
       - name: Build and post the open-source dossier
-        uses: ./.github/actions/build-and-post
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/build-and-post@fcb2b6d5dea5682d6d639b1d118681a67bc534fb
         with:
           door: opensource
           callback_url: ${{ env.CALLBACK_URL }}
