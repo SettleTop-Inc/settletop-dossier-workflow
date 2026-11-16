@@ -152,7 +152,12 @@ jobs:
           SCAN_RUN_ID: ${{ inputs.scan_run_id }}
         run: |
           set -uo pipefail
-          cname="dossier-engine-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          # The ticker outlives this step (it beats while the separate run-engine step holds the
+          # container), so it runs as a detached `nohup bash` reading a written script. CNAME is the only
+          # value it needs that is not already exported: INPUT_REPO/INPUT_COMMIT/SCAN_RUN_ID come from the
+          # step env, PROGRESS_URL from the workflow env, RUNNER_TEMP from the runner. Export CNAME and the
+          # forked bash inherits them all (no var-assignment prefix, which shellcheck flags SC2097/SC2098).
+          export CNAME="dossier-engine-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           cat > "$RUNNER_TEMP/heartbeat.sh" <<'HB'
           set -uo pipefail
           while true; do
@@ -164,9 +169,7 @@ jobs:
               -H 'Content-Type: application/json' --data-binary @"$RUNNER_TEMP/hb.json" "$PROGRESS_URL" > /dev/null || true
           done
           HB
-          CNAME="$cname" INPUT_REPO="$INPUT_REPO" INPUT_COMMIT="$INPUT_COMMIT" \
-            SCAN_RUN_ID="$SCAN_RUN_ID" PROGRESS_URL="$PROGRESS_URL" RUNNER_TEMP="$RUNNER_TEMP" \
-            nohup bash "$RUNNER_TEMP/heartbeat.sh" > /dev/null 2>&1 &
+          nohup bash "$RUNNER_TEMP/heartbeat.sh" > /dev/null 2>&1 &
           disown
 
       - name: Run the engine (verify provenance + pinned sandbox scan)
