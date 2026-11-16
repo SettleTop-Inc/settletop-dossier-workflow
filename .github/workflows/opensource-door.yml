@@ -5,20 +5,28 @@
 # door uses (no licence), and POSTs the engine share envelope to the opensource callback with a GitHub
 # OIDC id-token. runs-on is GitHub-hosted so a caller cannot route the run to a runner it controls.
 #
+# The scan flags, provenance verify, OSS tool runs, normalize, OIDC mint and POST now live in the three
+# LOCAL composite actions (.github/actions/run-engine, run-tool, build-and-post), shared byte-for-byte
+# with the private door (spec 2026-11-16-one-scan-path). This door keeps ONLY its door-specific steps:
+# the tokenless clone, the progress pings, and the container-name heartbeat ticker.
+#
 # SECURITY: the engine image, the engine memory, the ingest audience and the callback URL are HARDCODED
 # below, NOT caller inputs. The caller workflow lives in the initiator's own host repo, so if any of these
 # were an input the initiator could point the scan at a forged engine and post a fabricated result into
 # the SHARED open-source dossier. Only the scan TARGET (repo, commit, scan_run_id) comes from the caller,
-# and the registry verifies repo/commit against its own scan_run row. Bump the engine digest here and
-# re-pin OPENSOURCE_REUSABLE + INGEST_OPENSOURCE_WORKFLOW_REF to the new commit SHA together.
+# and the registry verifies repo/commit against its own scan_run row. Bump the engine digest in the ONE
+# ENGINE_IMAGE env below and re-pin OPENSOURCE_REUSABLE + INGEST_OPENSOURCE_WORKFLOW_REF to the new commit
+# SHA together.
 #
 # JOBS (#319, epic #310 - mirrors the private door's W1 + W2):
-#   scan          clone -> verify engine provenance -> run engine -> share+findings artifact.
-#   tools-trivy   OSS deploy scanner, PARALLEL to scan (own tokenless clone), soft-fails to `skipped`.
-#   tools-zizmor  workflow scanner, PARALLEL to scan, soft-fails to `skipped`.
-#   upload        needs all three; folds the scanners into a SEPARATE tool `envelope` with the engine's
-#                 `normalize` and POSTs the callback. The scanners NEVER block the core upload: `upload`
-#                 runs whenever `scan` succeeded, whatever the scanners did, and the envelope is best-effort.
+#   scan              clone -> run-engine (verify provenance + run) -> share+findings artifact.
+#   tools-trivy       OSS deploy scanner, PARALLEL to scan (own tokenless clone), soft-fails to `skipped`.
+#   tools-zizmor      workflow scanner, PARALLEL to scan, soft-fails to `skipped`.
+#   tools-qscan       post-quantum crypto scanner, PARALLEL to scan, soft-fails to `skipped`.
+#   tools-trivy-sbom  engine-BOM CVE scanner, runs AFTER scan (needs its BOM), soft-fails to `skipped`.
+#   upload            needs all four; folds the scanners into a SEPARATE tool `envelope` with the engine's
+#                     `normalize` and POSTs the callback. The scanners NEVER block the core upload: `upload`
+#                     runs whenever `scan` succeeded, whatever the scanners did, and the envelope is best-effort.
 # The scanners add ~no wall-clock (they run beside the engine, the long pole) and send nothing out on
 # their own: only `upload` posts, in one authed call, exactly as before plus the optional envelope key.
 name: SettleTop Open-Source Door
@@ -57,15 +65,16 @@ defaults:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # scan (core, unchanged behavior minus the POST): clone -> verify -> engine ->
-  # share+findings transfer artifact that `upload` posts. Produces the exact same
-  # share.json a no-tool run did; the tool posture is layered on separately.
+  # scan (core): clone -> run-engine (provenance verify + pinned engine run) ->
+  # share+findings transfer artifact that `upload` posts. run-engine holds the scan
+  # flags; this job keeps only the tokenless clone, the progress pings, and the
+  # container-name heartbeat ticker.
   # ---------------------------------------------------------------------------
   scan:
     runs-on: ubuntu-latest # GitHub-hosted only: a caller cannot route this to a runner it controls
     timeout-minutes: 30
     permissions:
-      packages: read # gh attestation verify reads the engine image's attestation from GHCR
+      packages: read # run-engine's `gh attestation verify` reads the engine image's attestation from GHCR
     outputs:
       report-artifact-id: ${{ steps.upload.outputs.artifact-id }}
       run-started-at: ${{ steps.runstart.outputs.at }}
@@ -105,28 +114,14 @@ jobs:
           INPUT_COMMIT: ${{ inputs.commit }}
         run: |
           set -euo pipefail
-          t0=$(date +%s%3N) # #382 clone wall; carried to the engine step via $GITHUB_ENV
-          git init -q clone
-          git -C clone remote add origin "https://github.com/${INPUT_REPO}.git"
-          git -C clone -c protocol.version=2 fetch -q --depth 1 origin "${INPUT_COMMIT}"
-          git -C clone checkout -q FETCH_HEAD
-          mkdir -p out
+          t0=$(date +%s%3N) # #382 clone wall; passed to run-engine as fetch_ms
+          # Clone into `src` so run-engine mounts /work/src (the basename names the subject; keeping
+          # `src` keeps today's /work/src so facts_sha256 does not move).
+          git init -q src
+          git -C src remote add origin "https://github.com/${INPUT_REPO}.git"
+          git -C src -c protocol.version=2 fetch -q --depth 1 origin "${INPUT_COMMIT}"
+          git -C src checkout -q FETCH_HEAD
           echo "CLONE_MS=$(( $(date +%s%3N) - t0 ))" >> "$GITHUB_ENV"
-
-      - name: Verify the engine image's build provenance
-        # Reject any engine image not built by our signer workflow BEFORE it runs (issue #298).
-        # --bundle-from-oci reads the attestation from the PUBLIC customer image in GHCR, so this works
-        # from the initiator's runner, which has no read access to our private SettleTop-AI-Dossier repo.
-        # Checks the SAME $ENGINE_IMAGE digest the run step below pulls, so the two cannot drift apart.
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh attestation verify "oci://$ENGINE_IMAGE" \
-            --bundle-from-oci \
-            --repo SettleTop-Inc/SettleTop-AI-Dossier \
-            --signer-workflow SettleTop-Inc/SettleTop-AI-Dossier/.github/workflows/engine-image.yml
-          echo "Engine image provenance verified: $ENGINE_IMAGE" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Progress analyzing
         env:
@@ -141,93 +136,68 @@ jobs:
           curl -sS --proto '=https' --tlsv1.2 --max-time 20 -X POST \
             -H 'Content-Type: application/json' --data-binary @progress.json "$PROGRESS_URL" > /dev/null || true
 
-      - name: Run the engine in a sandbox (pinned image, no network, read-only, non-root)
+      - name: Start the analyze heartbeat ticker (background, container-tied)
+        # #318 pair (registry PR #1006): analyze is the long SILENT phase, so with no ping the reaper's
+        # no-heartbeat clock would fail a live run. While the engine CONTAINER run-engine will create is
+        # running, POST an `analyzing` ping (same body/url/token as the progress steps) every ~90s. The
+        # container name is deterministic from the same runner vars run-engine uses, so the door finds it
+        # with `docker inspect`. Tied to the container, never a shell PID: a vanished/exited container
+        # stops the beats, so a dead engine is no longer masked; a true in-container hang keeps
+        # State.Running=true and is left to the job timeout / registry's 45-min ceiling. The ticker is
+        # backgrounded (nohup/disown) so this step ends while it runs beside run-engine, and the job end
+        # reaps it. Best effort: a ping must NEVER fail the scan.
         env:
           INPUT_REPO: ${{ inputs.repo }}
           INPUT_COMMIT: ${{ inputs.commit }}
           SCAN_RUN_ID: ${{ inputs.scan_run_id }}
         run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/engine.log" # engine output stays on this runner, never the live log
-          extra=(); [ -z "$ENGINE_COMMIT" ] || extra=(--engine-commit "$ENGINE_COMMIT")
-          t_pull=$(date +%s%3N) # #382 engine pull + run walls (best-effort, envelope-only timing)
-          docker pull --quiet "$ENGINE_IMAGE" > /dev/null
-          t_run=$(date +%s%3N)
-          cname="dossier-engine-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          # Heartbeat ticker (#318 pair, registry PR #1006): analyze is the long SILENT phase, so with no
-          # ping the reaper's no-heartbeat clock would fail a live run. While the engine CONTAINER is
-          # running, POST an `analyzing` ping (same body/url/token as the progress steps) every ~90s. Tied
-          # to the container, never a shell PID: a vanished/exited container stops the beats, so a dead
-          # engine is no longer masked; a true in-container hang keeps State.Running=true and is left to
-          # the job timeout / registry's 45-min ceiling. Best effort: a ping must NEVER fail the scan.
-          heartbeat() {
-            while true; do
-              sleep 90
-              [ "$(docker inspect -f '{{.State.Running}}' "$cname" 2>/dev/null)" = "true" ] || continue
-              jq -n --arg srid "$SCAN_RUN_ID" --arg repo "$INPUT_REPO" --arg commit "$INPUT_COMMIT" \
-                '{scan_run_id:$srid, subject:{repo:$repo, commit:$commit}, phase:"analyzing"}' > "$RUNNER_TEMP/hb.json"
-              curl -sS --proto '=https' --tlsv1.2 --max-time 20 --retry 2 -X POST \
-                -H 'Content-Type: application/json' --data-binary @"$RUNNER_TEMP/hb.json" "$PROGRESS_URL" > /dev/null || true
-            done
-          }
-          heartbeat & hb_pid=$!
-          trap 'kill "$hb_pid" 2>/dev/null || true' EXIT # the ticker can never outlive this step
-          # Sandbox (same shape as the private door): no network, the runner user (so git trusts the mount),
-          # read-only root, no-new-privileges, tmpfs /tmp, all capabilities dropped, memory + pid limits.
-          set +e
-          docker run --rm \
-            --name "$cname" \
-            --network none \
-            --user "$(id -u):$(id -g)" \
-            --read-only \
-            --tmpfs /tmp:rw,noexec,nosuid,size=512m \
-            --cap-drop ALL \
-            --security-opt no-new-privileges \
-            --memory "$ENGINE_MEMORY" --memory-swap "$ENGINE_MEMORY" \
-            --pids-limit 256 \
-            -e HOME=/tmp -e GIT_CONFIG_NOSYSTEM=1 \
-            -v "$PWD/clone:/work/src:ro" \
-            -v "$PWD/out:/out" \
-            "$ENGINE_IMAGE" \
-            scan --path /work/src --commit "${INPUT_COMMIT}" \
-              --image-digest "${ENGINE_IMAGE##*@}" \
-              --include-hidden \
-              --share-out /out/share.json \
-              --bom-out /out/bom.cdx.json \
-              --trivy-bom-out /out/bom.trivy.cdx.json \
-              --sarif-out /out/results.sarif \
-              --findings-out /out/findings.json \
-              --html-out /out/summary.html \
-              "${extra[@]}" \
-            > "$log" 2>&1
-          status=$?
-          set -e
-          t_end=$(date +%s%3N) # #382 engine docker-run wall
-          if [ "$status" -ne 0 ]; then
-            echo "::error::the engine exited with status $status (its log stays on the runner and is not printed)"
-            exit 1
-          fi
-          [ -s out/share.json ] || { echo "::error::the engine did not write share.json"; exit 1; }
-          [ -s out/findings.json ] || { echo "::error::the engine did not write findings.json"; exit 1; }
-          # #382 per-step walls for the scan-time breakdown, carried in the report artifact. Best-effort
-          # and envelope-only: a write failure here must never fail the scan, and this never touches
-          # share.json or any hash. The engine's own phase timers (read/rules/analyze/taint/linker) ride
-          # in share.json's run_meta.run_metrics already.
-          printf '{"clone_ms":%s,"pull_ms":%s,"scan_wall_ms":%s}' \
-            "${CLONE_MS:-0}" "$(( t_run - t_pull ))" "$(( t_end - t_run ))" > out/door-timing.json || true
+          set -uo pipefail
+          # The ticker outlives this step (it beats while the separate run-engine step holds the
+          # container), so it runs as a detached `nohup bash` reading a written script. CNAME is the only
+          # value it needs that is not already exported: INPUT_REPO/INPUT_COMMIT/SCAN_RUN_ID come from the
+          # step env, PROGRESS_URL from the workflow env, RUNNER_TEMP from the runner. Export CNAME and the
+          # forked bash inherits them all (no var-assignment prefix, which shellcheck flags SC2097/SC2098).
+          export CNAME="dossier-engine-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cat > "$RUNNER_TEMP/heartbeat.sh" <<'HB'
+          set -uo pipefail
+          while true; do
+            sleep 90
+            [ "$(docker inspect -f '{{.State.Running}}' "$CNAME" 2>/dev/null)" = "true" ] || continue
+            jq -n --arg srid "$SCAN_RUN_ID" --arg repo "$INPUT_REPO" --arg commit "$INPUT_COMMIT" \
+              '{scan_run_id:$srid, subject:{repo:$repo, commit:$commit}, phase:"analyzing"}' > "$RUNNER_TEMP/hb.json"
+            curl -sS --proto '=https' --tlsv1.2 --max-time 20 --retry 2 -X POST \
+              -H 'Content-Type: application/json' --data-binary @"$RUNNER_TEMP/hb.json" "$PROGRESS_URL" > /dev/null || true
+          done
+          HB
+          nohup bash "$RUNNER_TEMP/heartbeat.sh" > /dev/null 2>&1 &
+          disown
+
+      - name: Run the engine (verify provenance + pinned sandbox scan)
+        id: engine
+        uses: ./.github/actions/run-engine
+        with:
+          engine_image: ${{ env.ENGINE_IMAGE }}
+          engine_memory: ${{ env.ENGINE_MEMORY }}
+          engine_commit: ${{ env.ENGINE_COMMIT }}
+          source_dir: src
+          commit: ${{ inputs.commit }}
+          require_licence: "false"
+          fetch_ms: ${{ env.CLONE_MS }}
+          fetch_kind: clone
+          gh_token: ${{ github.token }}
 
       - name: Pass the report on (1-day artifact)
         id: upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dossier-os-report-${{ github.run_id }}-${{ github.run_attempt }}
-          path: out
+          path: ${{ steps.engine.outputs.out-dir }}
           retention-days: 1
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # tools-trivy / tools-zizmor (#317 applied to the open-source door). Own tokenless
-  # clone, run PARALLEL to `scan`, every tool error soft-fails to status `skipped`.
+  # tools-trivy / tools-zizmor / tools-qscan (#317 applied to the open-source door). Own tokenless
+  # clone, run PARALLEL to `scan`, every tool error soft-fails to status `skipped` inside run-tool.
   # They send nothing out; `upload` folds their output into the tool envelope.
   # ---------------------------------------------------------------------------
   tools-trivy:
@@ -261,52 +231,12 @@ jobs:
           git -C clone -c protocol.version=2 fetch -q --depth 1 origin "${INPUT_COMMIT}"
           git -C clone checkout -q FETCH_HEAD
 
-      - name: Install Trivy (pinned, checksum-verified)
-        continue-on-error: true # a blocked download must not fail the job; the scan step records `skipped`
-        run: |
-          set -euo pipefail
-          bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"
-          base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
-          tgz="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$RUNNER_TEMP/$tgz" "$base/$tgz"
-          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$RUNNER_TEMP/trivy_checksums.txt" \
-            "$base/trivy_${TRIVY_VERSION}_checksums.txt"
-          ( cd "$RUNNER_TEMP" && grep " $tgz\$" trivy_checksums.txt | sha256sum -c - )
-          tar -xzf "$RUNNER_TEMP/$tgz" -C "$bin" trivy
-          echo "$bin" >> "$GITHUB_PATH"
-
-      - name: "Scan the clone (fs vuln + misconfig; soft-fail to skipped)"
-        id: scan
-        continue-on-error: true
-        env:
-          TRIVY_USERNAME: ${{ github.actor }}
-          TRIVY_PASSWORD: ${{ github.token }} # authed ghcr.io/aquasecurity/trivy-db pull
-        run: |
-          set -uo pipefail
-          t0=$(date +%s%3N) # #382 tool scan wall (parallel to the engine)
-          out="$RUNNER_TEMP/out"; mkdir -p "$out"
-          cache="$RUNNER_TEMP/trivy-cache"
-          status=skipped; db_snapshot=""
-          if command -v trivy > /dev/null; then
-            if trivy fs --download-db-only --cache-dir "$cache" --timeout 5m 2> "$RUNNER_TEMP/trivy-db.log"; then
-              db_snapshot="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["UpdatedAt"][:10])' \
-                "$cache/db/metadata.json" 2>/dev/null || true)"
-              if trivy fs --scanners vuln,misconfig --format json --skip-db-update \
-                   --cache-dir "$cache" --timeout 10m --output "$out/trivy.json" clone 2> "$RUNNER_TEMP/trivy-scan.log" \
-                 && [ -s "$out/trivy.json" ]; then
-                status=ok
-              else
-                rm -f "$out/trivy.json"
-              fi
-            else
-              echo "::warning::Trivy vuln-DB pull failed; status=skipped (dossier unaffected)"
-            fi
-          else
-            echo "::warning::Trivy is not installed (download failed); status=skipped"
-          fi
-          python3 -I -c 'import json,sys; json.dump({"name":"trivy","version":sys.argv[1],"db_snapshot":sys.argv[2],"status":sys.argv[3],"ms":int(sys.argv[5])}, open(sys.argv[4],"w"))' \
-            "$TRIVY_VERSION" "$db_snapshot" "$status" "$out/tools-trivy.json" "$(( $(date +%s%3N) - t0 ))"
-          echo "Trivy $TRIVY_VERSION: status=$status db_snapshot=${db_snapshot:-none}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Run Trivy (fs vuln + misconfig; soft-fail to skipped)
+        uses: ./.github/actions/run-tool
+        with:
+          tool: trivy
+          source_dir: clone
+          trivy_version: ${{ env.TRIVY_VERSION }}
 
       - name: Pass the tool output on (1-day artifact)
         id: upload
@@ -348,31 +278,12 @@ jobs:
           git -C clone -c protocol.version=2 fetch -q --depth 1 origin "${INPUT_COMMIT}"
           git -C clone checkout -q FETCH_HEAD
 
-      - name: "Scan the workflows (SARIF; soft-fail to skipped)"
-        id: scan
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }} # zizmor's online audits query the GitHub API
-        run: |
-          set -uo pipefail
-          t0=$(date +%s%3N) # #382 tool scan wall (parallel to the engine)
-          out="$RUNNER_TEMP/out"; mkdir -p "$out"
-          status=skipped
-          if [ -d clone/.github/workflows ]; then
-            pipx run "zizmor==${ZIZMOR_VERSION}" --format sarif clone/.github/workflows \
-              > "$out/zizmor.sarif" 2> "$RUNNER_TEMP/zizmor.log" || true
-            if python3 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("runs") is not None else 1)' \
-                 "$out/zizmor.sarif" 2>/dev/null; then
-              status=ok
-            else
-              rm -f "$out/zizmor.sarif"
-            fi
-          else
-            echo "::notice::no .github/workflows to scan; zizmor status=skipped"
-          fi
-          python3 -I -c 'import json,sys; json.dump({"name":"zizmor","version":sys.argv[1],"db_snapshot":"","status":sys.argv[2],"ms":int(sys.argv[4])}, open(sys.argv[3],"w"))' \
-            "$ZIZMOR_VERSION" "$status" "$out/tools-zizmor.json" "$(( $(date +%s%3N) - t0 ))"
-          echo "zizmor $ZIZMOR_VERSION: status=$status" >> "$GITHUB_STEP_SUMMARY"
+      - name: Run zizmor (workflow SARIF; soft-fail to skipped)
+        uses: ./.github/actions/run-tool
+        with:
+          tool: zizmor
+          source_dir: clone
+          zizmor_version: ${{ env.ZIZMOR_VERSION }}
 
       - name: Pass the tool output on (1-day artifact)
         id: upload
@@ -414,40 +325,12 @@ jobs:
           git -C clone -c protocol.version=2 fetch -q --depth 1 origin "${INPUT_COMMIT}"
           git -C clone checkout -q FETCH_HEAD
 
-      - name: Set up Node 20
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - name: Run qscan (post-quantum crypto SARIF + CBOM; soft-fail to skipped)
+        uses: ./.github/actions/run-tool
         with:
-          node-version: "20"
-
-      - name: "Scan for quantum-vulnerable crypto (SARIF + CBOM; soft-fail to skipped)"
-        id: scan
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          t0=$(date +%s%3N) # #382 tool scan wall (parallel to the engine)
-          out="$RUNNER_TEMP/out"; mkdir -p "$out"
-          status=skipped
-          # npx runs the version-pinned qscan ephemerally; npm's integrity sha512 content-pins the
-          # download. qscan exits non-zero when it FINDS vulnerable crypto - that is not a tool
-          # failure, so status is `ok` whenever a valid SARIF was written, else `skipped`.
-          npx -y "@quantakrypto/qscan@${QSCAN_VERSION}" clone --format sarif -o "$out/qscan.sarif" \
-            > "$RUNNER_TEMP/qscan-sarif.log" 2>&1 || true
-          npx -y "@quantakrypto/qscan@${QSCAN_VERSION}" clone --cbom -o "$out/qscan.cbom.json" \
-            > "$RUNNER_TEMP/qscan-cbom.log" 2>&1 || true
-          if python3 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("runs") is not None else 1)' \
-               "$out/qscan.sarif" 2>/dev/null; then
-            status=ok
-          else
-            rm -f "$out/qscan.sarif"
-          fi
-          # Keep the CBOM only when it parsed as a CycloneDX doc; drop it otherwise.
-          if ! python3 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("bomFormat")=="CycloneDX" else 1)' \
-               "$out/qscan.cbom.json" 2>/dev/null; then
-            rm -f "$out/qscan.cbom.json"
-          fi
-          python3 -I -c 'import json,sys; json.dump({"name":"qscan","version":sys.argv[1],"db_snapshot":"","status":sys.argv[2],"ms":int(sys.argv[4])}, open(sys.argv[3],"w"))' \
-            "$QSCAN_VERSION" "$status" "$out/tools-qscan.json" "$(( $(date +%s%3N) - t0 ))"
-          echo "qscan $QSCAN_VERSION: status=$status" >> "$GITHUB_STEP_SUMMARY"
+          tool: qscan
+          source_dir: clone
+          qscan_version: ${{ env.QSCAN_VERSION }}
 
       - name: Pass the tool output on (1-day artifact)
         id: upload
@@ -465,11 +348,9 @@ jobs:
   # Trivy's PkgIdentifier.BOMRef). Unlike tools-trivy (which scans the source clone for deploy
   # posture), this NEEDS the engine output, so it runs AFTER `scan` and downloads the report
   # artifact for bom.trivy.cdx.json (the engine's CycloneDX 1.6 BOM from --trivy-bom-out; Trivy
-  # rejects the 1.7 AI-BOM). The scan TARGET stays the registry-verified repo: the only input
-  # here is the engine's own BOM, and the only new network call is the Trivy vuln-DB pull (authed
-  # ghcr). It runs in its OWN job so that pull never widens the hardened `scan` job's surface.
-  # Soft-fails to `skipped`; `upload` folds trivy-sbom.json into the envelope via normalize. It
-  # sends NOTHING out itself (only `upload` posts).
+  # rejects the 1.7 AI-BOM). It runs in its OWN job so the authed Trivy vuln-DB pull never widens
+  # the hardened `scan` job's surface. Soft-fails to `skipped` inside run-tool; `upload` folds
+  # trivy-sbom.json into the envelope via normalize. It sends NOTHING out itself (only `upload` posts).
   # ---------------------------------------------------------------------------
   tools-trivy-sbom:
     if: ${{ !cancelled() && needs.scan.result == 'success' }}
@@ -490,56 +371,12 @@ jobs:
           path: report
           merge-multiple: true
 
-      - name: Install Trivy (pinned, checksum-verified)
-        continue-on-error: true # a blocked download must not fail the job; the scan step records `skipped`
-        run: |
-          set -euo pipefail
-          bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"
-          base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
-          tgz="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$RUNNER_TEMP/$tgz" "$base/$tgz"
-          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$RUNNER_TEMP/trivy_checksums.txt" \
-            "$base/trivy_${TRIVY_VERSION}_checksums.txt"
-          ( cd "$RUNNER_TEMP" && grep " $tgz\$" trivy_checksums.txt | sha256sum -c - )
-          tar -xzf "$RUNNER_TEMP/$tgz" -C "$bin" trivy
-          echo "$bin" >> "$GITHUB_PATH"
-
-      - name: "Scan the AI-BOM for CVEs (soft-fail to skipped)"
-        id: scan
-        continue-on-error: true
-        env:
-          TRIVY_USERNAME: ${{ github.actor }}
-          TRIVY_PASSWORD: ${{ github.token }} # authed ghcr.io/aquasecurity/trivy-db pull
-        run: |
-          set -uo pipefail
-          t0=$(date +%s%3N) # #382 tool scan wall (runs after the engine, beside the upload)
-          out="$RUNNER_TEMP/out"; mkdir -p "$out"
-          cache="$RUNNER_TEMP/trivy-cache"
-          bom="report/bom.trivy.cdx.json" # the engine's 1.6 Trivy-facing BOM, not the 1.7 AI-BOM
-          status=skipped; db_snapshot=""
-          if command -v trivy > /dev/null && [ -s "$bom" ]; then
-            if trivy sbom --download-db-only --cache-dir "$cache" --timeout 5m 2> "$RUNNER_TEMP/trivy-db.log"; then
-              db_snapshot="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["UpdatedAt"][:10])' \
-                "$cache/db/metadata.json" 2>/dev/null || true)"
-              # Each vuln carries PkgIdentifier.BOMRef (the component bom-ref); normalize reads it as canonical_key.
-              if trivy sbom --format json --scanners vuln --skip-db-update \
-                   --cache-dir "$cache" --timeout 10m --output "$out/trivy-sbom.json" "$bom" 2> "$RUNNER_TEMP/trivy-sbom.log" \
-                 && [ -s "$out/trivy-sbom.json" ]; then
-                status=ok
-              else
-                rm -f "$out/trivy-sbom.json"
-              fi
-            else
-              echo "::warning::Trivy vuln-DB pull failed; status=skipped (dossier unaffected)"
-            fi
-          elif [ ! -s "$bom" ]; then
-            echo "::warning::no bom.trivy.cdx.json in the report; trivy-sbom status=skipped"
-          else
-            echo "::warning::Trivy is not installed (download failed); status=skipped"
-          fi
-          python3 -I -c 'import json,sys; json.dump({"name":"trivy-sbom","version":sys.argv[1],"db_snapshot":sys.argv[2],"status":sys.argv[3],"ms":int(sys.argv[5])}, open(sys.argv[4],"w"))' \
-            "$TRIVY_VERSION" "$db_snapshot" "$status" "$out/tools-trivy-sbom.json" "$(( $(date +%s%3N) - t0 ))"
-          echo "Trivy SBOM $TRIVY_VERSION: status=$status db_snapshot=${db_snapshot:-none}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Run Trivy on the engine BOM (CVEs; soft-fail to skipped)
+        uses: ./.github/actions/run-tool
+        with:
+          tool: trivy-sbom
+          bom_path: report/bom.trivy.cdx.json
+          trivy_version: ${{ env.TRIVY_VERSION }}
 
       - name: Pass the tool output on (1-day artifact)
         id: upload
@@ -554,9 +391,10 @@ jobs:
   # ---------------------------------------------------------------------------
   # upload (#318 applied to the open-source door). Mint the OIDC id-token, fold the
   # scanners into a SEPARATE tool `envelope` with the engine's `normalize`, and POST
-  # the callback. `needs` the scanners only to ORDER after them; `if` runs whenever
-  # `scan` succeeded, so a failed/skipped scanner never blocks the core upload. The
-  # envelope is best-effort and never touches `report`/share or any hash (#310/#318).
+  # the callback -- all inside build-and-post. `needs` the scanners only to ORDER after
+  # them; `if` runs whenever `scan` succeeded, so a failed/skipped scanner never blocks
+  # the core upload. The envelope is best-effort and never touches `report`/share or any
+  # hash (#310/#318). This job keeps only the progress ping; build-and-post does the rest.
   # ---------------------------------------------------------------------------
   upload:
     if: ${{ !cancelled() && needs.scan.result == 'success' }}
@@ -574,207 +412,21 @@ jobs:
           PHASE: uploading
         run: |
           set -uo pipefail # best effort: a ping must NEVER fail a scan
-          echo "UPLOAD_T0=$(date +%s%3N)" >> "$GITHUB_ENV" # #382 upload-job wall (download + normalize + POST)
           jq -n --arg srid "$SCAN_RUN_ID" --arg repo "$INPUT_REPO" --arg commit "$INPUT_COMMIT" --arg phase "$PHASE" \
             '{scan_run_id:$srid, subject:{repo:$repo, commit:$commit}, phase:$phase}' > progress.json
           curl -sS --proto '=https' --tlsv1.2 --max-time 20 -X POST \
             -H 'Content-Type: application/json' --data-binary @progress.json "$PROGRESS_URL" > /dev/null || true
 
-      - name: Download the report
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - name: Build and post the open-source dossier
+        uses: ./.github/actions/build-and-post
         with:
-          artifact-ids: ${{ needs.scan.outputs.report-artifact-id }}
-          path: report
-          merge-multiple: true
-
-      # --- CVE posture (#318). Best-effort: a missing artifact or a normalize error logs a
-      # warning and the core open-source dossier is posted alone. findings.json is read only to
-      # dedup and never leaves; the envelope carries advisories/imported/tools, no source text.
-      - name: Fetch the scanner output (best-effort)
-        continue-on-error: true
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: dossier-os-tools-*-${{ github.run_id }}-${{ github.run_attempt }}
-          path: tools
-          merge-multiple: true
-
-      - name: Normalize scanner output into the tool envelope (best-effort)
-        continue-on-error: true # a normalize failure must never block the core callback
-        env:
-          REPOSITORY_ID: ${{ github.repository_id }}
-          RUN_ID: ${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          mkdir -p tools
-          cp report/findings.json tools/findings.json 2>/dev/null || true
-          python3 -I - tools > "$RUNNER_TEMP/nargs" <<'PY'
-          import json, os, sys
-          t = sys.argv[1]
-          def meta(fname, name):
-              try:
-                  d = json.load(open(os.path.join(t, fname)))
-              except Exception:
-                  d = {"name": name}
-              return d.get("version", ""), d.get("db_snapshot", ""), d.get("status", "skipped")
-          tv, tdb, ts = meta("tools-trivy.json", "trivy")
-          zv, zdb, zs = meta("tools-zizmor.json", "zizmor")
-          sv, sdb, ss = meta("tools-trivy-sbom.json", "trivy-sbom")  # AI-BOM CVE scan (#826)
-          qv, qdb, qs = meta("tools-qscan.json", "qscan")  # post-quantum crypto scan (#364)
-          args = []
-          if os.path.exists(os.path.join(t, "trivy.json")):
-              args += ["--trivy-json", "/in/trivy.json"]
-          # The AI-BOM CVE scan: normalize maps each vuln to an advisory with canonical_key =
-          # PkgIdentifier.BOMRef. When present it is the vuln source; --trivy-json is then misconfig-only.
-          if os.path.exists(os.path.join(t, "trivy-sbom.json")):
-              args += ["--trivy-sbom-json", "/in/trivy-sbom.json"]
-          if os.path.exists(os.path.join(t, "zizmor.sarif")):
-              args += ["--sarif", "/in/zizmor.sarif:zizmor"]
-          # qscan's post-quantum crypto findings (SARIF) and CBOM (CycloneDX 1.6).
-          if os.path.exists(os.path.join(t, "qscan.sarif")):
-              args += ["--qscan-sarif", "/in/qscan.sarif"]
-          if os.path.exists(os.path.join(t, "qscan.cbom.json")):
-              args += ["--qscan-cbom", "/in/qscan.cbom.json"]
-          if os.path.exists(os.path.join(t, "findings.json")):
-              args += ["--findings", "/in/findings.json"]
-          db = tdb or sdb  # fs and sbom pull the same vuln-DB; use whichever ran
-          if db:
-              args += ["--db-snapshot", db]
-          args += ["--tool", f"trivy:{tv}:{tdb}:{ts}"]
-          args += ["--tool", f"zizmor:{zv}:{zdb}:{zs}"]
-          args += ["--tool", f"trivy-sbom:{sv}:{sdb}:{ss}"]
-          args += ["--tool", f"qscan:{qv}:{qdb}:{qs}"]
-          print("\n".join(args))
-          PY
-          mapfile -t NARGS < "$RUNNER_TEMP/nargs"
-          nout="$RUNNER_TEMP/nout"; mkdir -p "$nout"
-          # Same sandbox shape the engine runs in: no network, non-root, read-only root, caps dropped.
-          # normalize drops any SEC-tripping row itself; it never touches share or any hash.
-          docker pull --quiet "$ENGINE_IMAGE" > /dev/null
-          docker run --rm --network none --user "$(id -u):$(id -g)" --read-only \
-            --tmpfs /tmp:rw,noexec,nosuid,size=64m --cap-drop ALL --security-opt no-new-privileges \
-            --memory 512m --memory-swap 512m --pids-limit 64 \
-            -v "$PWD/tools:/in:ro" -v "$nout:/out" "$ENGINE_IMAGE" \
-            normalize --repository-id "$REPOSITORY_ID" --run-id "$RUN_ID" \
-              "${NARGS[@]}" --out /out/envelope.json
-          [ -s "$nout/envelope.json" ] || { echo "::warning::normalize produced no envelope"; exit 1; }
-          cp "$nout/envelope.json" tool-envelope.json # present only on success; the POST step keys off it
-
-      - name: Mint the OIDC id-token and POST the report to the opensource callback
-        env:
-          INPUT_REPO: ${{ inputs.repo }}
-          INPUT_COMMIT: ${{ inputs.commit }}
-          SCAN_RUN_ID: ${{ inputs.scan_run_id }}
-          RUN_STARTED_AT: ${{ needs.scan.outputs.run-started-at }} # #330: whole-run wall time -> run_meta.total_ms
-          MAX_ENVELOPE_BYTES: "4194304" # TODO(infra): 4 MiB. The whole POST body stays under this.
-        run: |
-          set -euo pipefail
-          # 1. GitHub identity token for the fixed audience. Masked before it is used anywhere.
-          oidc=$(curl -fsS --get --data-urlencode "audience=$INGEST_AUDIENCE" \
-            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" |
-            python3 -I -c 'import json,sys; print(json.load(sys.stdin)["value"])')
-          echo "::add-mask::$oidc"
-          # 2. Build the settletop.dossier-scan/2 body. `report` is the engine share.json VERBATIM (same
-          #    shape the private door uploads). `envelope` is the SEPARATE tool posture, added only when
-          #    normalize produced one; it rides in this SAME body (the registry links it to the share by
-          #    the check id the share ingest returns). subject echoes ONLY the dispatched repo + commit;
-          #    the registry binds identity from its own scan_run row and rejects a repo/commit mismatch.
-          python3 -I - <<'PY'
-          import json, os
-          from datetime import datetime, timezone
-          e = os.environ
-          report = json.load(open("report/share.json", encoding="utf-8"))
-          # #330: stamp the whole-run wall time (run start -> this upload: checkout, engine, scanners) into
-          # the run_meta envelope so the dossier shows the real scan time, not just the engine's
-          # read+analyze slice. run_meta is NOT hashed (share_sha256 covers the share block only), so this
-          # never affects ingest verification. Only added to an engine-emitted run_metrics, never fabricated.
-          rm = (report.get("run_meta") or {}).get("run_metrics")
-          started = e.get("RUN_STARTED_AT")
-          if started and isinstance(rm, dict):
-              try:
-                  t0 = datetime.fromisoformat(started.replace("Z", "+00:00"))
-                  total_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
-                  if total_ms >= 0:
-                      rm["total_ms"] = total_ms
-              except Exception:
-                  pass
-          # #382: the per-step walls for the scan-time breakdown, merged into the SAME run_meta envelope
-          # (never hashed). These are MEASURED step durations, and the tool steps run PARALLEL to the
-          # engine, so step_times is a where-the-time-goes map, NOT an additive timeline; total_ms above
-          # is the true wall. Best-effort: any piece that is missing is simply left out, and a failure
-          # here never blocks the POST.
-          if isinstance(rm, dict):
-              def _read(path):
-                  try:
-                      return json.load(open(path, encoding="utf-8"))
-                  except Exception:
-                      return {}
-              steps = {}
-              dt = _read("report/door-timing.json")
-              for k in ("clone_ms", "pull_ms", "scan_wall_ms"):
-                  v = dt.get(k)
-                  if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
-                      steps[k] = v
-              for fname, key in (("tools-trivy.json", "trivy_ms"), ("tools-zizmor.json", "zizmor_ms"),
-                                 ("tools-qscan.json", "qscan_ms"), ("tools-trivy-sbom.json", "trivy_sbom_ms")):
-                  v = _read(os.path.join("tools", fname)).get("ms")
-                  if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
-                      steps[key] = v
-              u0 = e.get("UPLOAD_T0")
-              if u0:
-                  try:
-                      upload_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - int(u0)
-                      if upload_ms >= 0:
-                          steps["upload_ms"] = upload_ms
-                  except Exception:
-                      pass
-              if steps:
-                  rm["step_times"] = steps
-          body = {
-              "schema": "settletop.dossier-scan/2",
-              "scan_run_id": e["SCAN_RUN_ID"],
-              "subject": {"repo": e["INPUT_REPO"], "commit": e["INPUT_COMMIT"], "unit_path": None},
-              "report": report,
-          }
-          dump = lambda o: json.dumps(o, separators=(",", ":"), ensure_ascii=False)
-          if os.path.exists("tool-envelope.json"):
-              env_obj = json.load(open("tool-envelope.json", encoding="utf-8"))
-              # Byte-cap guard (#826): normalize dedupes but does NOT cap, so the workflow caps the
-              # advisory list here. Keep the most severe, drop the rest, and LOG the count (never
-              # silent) before posting into the SHARED open-source dossier.
-              cap = int(e["MAX_ENVELOPE_BYTES"])
-              advs = env_obj.get("advisories", [])
-              rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-              ordered = sorted(advs, key=lambda a: rank.get(a.get("severity"), 5))
-              lo, hi = 0, len(ordered)
-              while lo < hi:  # largest worst-first prefix whose envelope fits the cap
-                  mid = (lo + hi + 1) // 2
-                  if len(dump({**env_obj, "advisories": ordered[:mid]}).encode()) <= cap:
-                      lo = mid
-                  else:
-                      hi = mid - 1
-              env_obj["advisories"] = ordered[:lo]
-              if len(dump(env_obj).encode()) <= cap:
-                  body["envelope"] = env_obj
-                  if lo < len(advs):
-                      print(f"::warning::tool envelope over the {cap}-byte cap; kept the {lo} most "
-                            f"severe of {len(advs)} advisories, dropped {len(advs) - lo}")
-              else:
-                  print(f"::warning::tool envelope exceeds the {cap}-byte cap even with no advisories; "
-                        f"posting the core dossier without it")
-          with open("payload.json", "w", encoding="utf-8") as f:
-              f.write(dump(body))
-          PY
-          # 3. POST. The bearer goes through curl's stdin config, not argv. Not --fail, so the body can show.
-          # Gzip the body: a big repo's dossier exceeds the serverless request-body cap (~4.5MB) uncompressed.
-          # The ingest route reads Content-Encoding and inflates before parsing. TLS still encrypts the wire.
-          gzip -c payload.json > payload.json.gz
-          status=$(printf 'header = "Authorization: Bearer %s"\n' "$oidc" | curl -K - -sS --proto '=https' \
-            --tlsv1.2 --max-time 120 --retry 2 -X POST \
-            -H 'Content-Type: application/json' \
-            -H 'Content-Encoding: gzip' \
-            --data-binary @payload.json.gz -o response.json -w '%{http_code}' "$CALLBACK_URL")
-          if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
-            echo "::error::opensource callback returned HTTP $status: $(head -c 500 response.json | tr -d '\r\n')"
-            exit 1
-          fi
-          echo "Shared the open-source dossier (HTTP $status)." >> "$GITHUB_STEP_SUMMARY"
+          door: opensource
+          callback_url: ${{ env.CALLBACK_URL }}
+          audience: ${{ env.INGEST_AUDIENCE }}
+          engine_image: ${{ env.ENGINE_IMAGE }}
+          report_artifact_id: ${{ needs.scan.outputs.report-artifact-id }}
+          tools_artifact_pattern: dossier-os-tools-*-${{ github.run_id }}-${{ github.run_attempt }}
+          subject_json: '{"repo":${{ toJSON(inputs.repo) }},"commit":${{ toJSON(inputs.commit) }},"unit_path":null}'
+          run_started_at: ${{ needs.scan.outputs.run-started-at }}
+          max_envelope_bytes: "4194304" # 4 MiB. The whole POST body stays under this.
+          scan_run_id: ${{ inputs.scan_run_id }}

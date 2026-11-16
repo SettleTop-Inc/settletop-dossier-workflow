@@ -39,15 +39,22 @@ inputs:
       downloads the report artifact to this path before calling the action.
     required: false
     default: report/bom.trivy.cdx.json
+  # Each version is needed only by the step that installs its own tool (trivy_version also by trivy-sbom),
+  # and every such step is gated by `if: inputs.tool == ...`. So a caller passes only the version for the
+  # tool it runs; the others stay unset. required:false keeps that lint-clean (actionlint does enforce a
+  # required input on a local `uses:` call, even though the runtime does not).
   trivy_version:
-    description: Pinned Trivy release for `trivy` and `trivy-sbom` (current pinned value 0.76.2). The door supplies it.
-    required: true
+    description: Pinned Trivy release for `trivy` and `trivy-sbom` (current pinned value 0.76.2). The door supplies it when tool is trivy or trivy-sbom.
+    required: false
+    default: ""
   zizmor_version:
-    description: Pinned zizmor release for `zizmor` (current pinned value 1.32.0). The door supplies it.
-    required: true
+    description: Pinned zizmor release for `zizmor` (current pinned value 1.32.0). The door supplies it when tool is zizmor.
+    required: false
+    default: ""
   qscan_version:
-    description: Pinned @quantakrypto/qscan release for `qscan` (current pinned value 0.12.0). The door supplies it.
-    required: true
+    description: Pinned @quantakrypto/qscan release for `qscan` (current pinned value 0.12.0). The door supplies it when tool is qscan.
+    required: false
+    default: ""
 
 runs:
   using: composite
