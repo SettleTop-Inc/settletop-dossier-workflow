@@ -35,6 +35,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0 # the pinned-action guard below reads the action.yml at the doors' pinned SHA
 
       - name: Install actionlint (pinned, checksum-verified)
         run: |
@@ -132,6 +133,40 @@ jobs:
           done
           [ "$fail" -eq 0 ] || exit 1
           echo "OK: both doors reference the shared actions by full path, one pinned SHA each"
+
+      - name: Pinned shared-action versions load clean (stale/broken-pin guard)
+        # The doors fetch the shared actions AT THE PINNED SHA, which can lag the in-repo copy. The
+        # wiring/run-tool jobs only load the LOCAL (./) copy, so a pin to a commit whose action.yml fails
+        # to load (e.g. a ${{ }} in input metadata) would still reach a live scan. This reads each
+        # action.yml at the doors' pinned SHA and fails if it is missing or not load-clean. Bumping an
+        # action's behavior means bumping this pinned SHA in both doors.
+        run: |
+          set -euo pipefail
+          sha=$(grep -oE 'settletop-dossier-workflow/\.github/actions/[a-z-]+@[0-9a-f]{40}' .github/workflows/private-door.yml | head -1 | sed -E 's/.*@//')
+          [ -n "$sha" ] || { echo "::error::no pinned shared-action SHA in private-door.yml"; exit 1; }
+          python3 -I - "$sha" <<'PY'
+          import sys, subprocess, yaml
+          sha = sys.argv[1]
+          marker = "$" + "{{"
+          bad = []
+          for name in ("run-engine", "run-tool", "build-and-post"):
+              path = f".github/actions/{name}/action.yml"
+              try:
+                  blob = subprocess.check_output(["git", "show", f"{sha}:{path}"], text=True)
+              except subprocess.CalledProcessError:
+                  bad.append(f"{name}@{sha[:12]}: not found at the pinned commit"); continue
+              doc = yaml.safe_load(blob)
+              if (doc.get("runs") or {}).get("using") != "composite":
+                  bad.append(f"{name}@{sha[:12]}: runs.using is not 'composite'")
+              for n, s in (doc.get("inputs") or {}).items():
+                  for f in ("description", "default"):
+                      v = s.get(f)
+                      if isinstance(v, str) and marker in v:
+                          bad.append(f"{name}@{sha[:12]}: input '{n}' {f} has a template expression (would fail to load)")
+          if bad:
+              print("\n".join(f"::error::{m}" for m in bad)); sys.exit(1)
+          print(f"OK: pinned shared actions @{sha[:12]} are load-clean")
+          PY
 
   run-tool-zizmor:
     runs-on: ubuntu-latest
