@@ -1,0 +1,292 @@
+# Shared POST path for both doors (spec 2026-11-16-one-scan-path, task 2.1 / 2.4 / 2.6).
+# Runs as steps inside each door's OWN post job (private `share`, opensource `upload`), so
+# `job_workflow_ref` stays the door's file and the private/opensource identity split holds
+# (issue #392). The job keeps `id-token: write` only.
+#
+# What it does (identical for both doors): download the report + tool artifacts, normalize the
+# scanners into the tool envelope (same engine sandbox + arg mapping as before), assemble
+# total_ms (#330) and step_times (#382), build the settletop.dossier-scan/2 body, mint the
+# OIDC token for the door's audience, gzip, and POST to the door's callback.
+#
+# ENV BOUNDARY: a composite action does NOT inherit the job's `env:` map, so every value a step
+# needs is set on that step via `env:` from an input, or is a runner var (RUNNER_TEMP, GITHUB_*,
+# ACTIONS_ID_TOKEN_REQUEST_*). The engine image, callback URL, audience, byte cap and the subject
+# shape are door-supplied INPUTS (each door hardcodes the fixed value); none is a workflow_call
+# input, so a customer caller can never reach them.
+#
+# STAYS IN THE DOOR (not here): the private `validate` gate (digest+size+schema+engine validate),
+# which reads the private check job's share-file-sha256/bytes + max-share-bytes and exposes
+# share-sha256 as a job output; opensource has no such inputs. The source fetch, licence, keep,
+# cleanup, fork guard and opensource progress pings also stay door jobs (spec 4.3).
+name: Build and post the dossier
+description: >-
+  Normalize the scanners, assemble the dossier timing, and POST the
+  settletop.dossier-scan/2 body to the door's callback with a GitHub OIDC token.
+
+inputs:
+  door:
+    description: "private | opensource. Documents intent and is available for step-summary wording; the body shape is driven by subject_json + scan_run_id, not a branch on this."
+    required: true
+  callback_url:
+    description: "The door's ingest callback URL (hardcoded in the door, never a workflow_call input)."
+    required: true
+  audience:
+    description: "The OIDC audience the callback pins (hardcoded in the door)."
+    required: true
+  engine_image:
+    description: "The @sha256-pinned engine image used for the normalize sandbox (hardcoded in the door)."
+    required: true
+  report_artifact_id:
+    description: "Artifact id of the engine report (share.json + findings.json + door-timing.json)."
+    required: true
+  tools_artifact_pattern:
+    description: "Glob for the scanner transfer artifacts, e.g. dossier-tools-*-<run>-<attempt>."
+    required: true
+  subject_json:
+    description: >-
+      The door-built subject object as a JSON string (spec 4.5: each door authors its own subject
+      keys). Private carries forge/repository_id/repo/commit/ref/run_id/run_attempt; opensource
+      carries repo/commit/unit_path. Embedded verbatim into the POST body.
+    required: true
+  run_started_at:
+    description: "Job-start timestamp stamped by the engine job (needs.*.outputs.run-started-at), for total_ms."
+    required: true
+  max_envelope_bytes:
+    description: "Byte cap for the tool envelope; the advisory list is trimmed worst-first to fit."
+    required: true
+  scan_run_id:
+    description: "Opensource only: the single-use scan_run token. Added as a top-level body key when set."
+    required: false
+    default: ""
+  idempotency_key:
+    description: "Private only: value for the Idempotency-Key POST header. Header omitted when empty."
+    required: false
+    default: ""
+
+outputs:
+  shared:
+    description: "true when the callback returned a 2xx."
+    value: ${{ steps.post.outputs.shared }}
+
+runs:
+  using: composite
+  steps:
+    - name: Stamp the upload-job start (#382 upload_ms = download + normalize + POST)
+      shell: bash
+      run: echo "UPLOAD_T0=$(date +%s%3N)" >> "$GITHUB_ENV"
+
+    - name: Download the report
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        artifact-ids: ${{ inputs.report_artifact_id }}
+        path: report
+        merge-multiple: true
+
+    # --- CVE posture (#318). Best-effort from here through normalize: a missing artifact or a
+    # normalize error logs a warning and the core dossier is posted alone. findings.json is read
+    # only to dedup and never leaves; the envelope carries advisories/imported/tools, no source.
+    - name: Fetch the scanner output (best-effort)
+      continue-on-error: true
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        pattern: ${{ inputs.tools_artifact_pattern }}
+        path: tools
+        merge-multiple: true
+
+    - name: Normalize scanner output into the tool envelope (best-effort)
+      continue-on-error: true # a normalize failure must never block the core callback
+      shell: bash
+      env:
+        ENGINE_IMAGE: ${{ inputs.engine_image }}
+        REPOSITORY_ID: ${{ github.repository_id }}
+        RUN_ID: ${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        mkdir -p tools
+        # findings.json rides in the report artifact; normalize reads it ONLY to dedup overlaps.
+        cp report/findings.json tools/findings.json 2>/dev/null || true
+        # Build normalize's args from each tool's recorded meta (name:version:db:status) and the
+        # files it actually produced. A `skipped` tool contributes only a --tool status row.
+        python3 -I - tools > "$RUNNER_TEMP/nargs" <<'PY'
+        import json, os, sys
+        t = sys.argv[1]
+        def meta(fname, name):
+            try:
+                d = json.load(open(os.path.join(t, fname)))
+            except Exception:
+                d = {"name": name}
+            return d.get("version", ""), d.get("db_snapshot", ""), d.get("status", "skipped")
+        tv, tdb, ts = meta("tools-trivy.json", "trivy")
+        zv, zdb, zs = meta("tools-zizmor.json", "zizmor")
+        sv, sdb, ss = meta("tools-trivy-sbom.json", "trivy-sbom")  # AI-BOM CVE scan (#826)
+        qv, qdb, qs = meta("tools-qscan.json", "qscan")  # post-quantum crypto scan (#364)
+        args = []
+        if os.path.exists(os.path.join(t, "trivy.json")):
+            args += ["--trivy-json", "/in/trivy.json"]
+        # The AI-BOM CVE scan: normalize maps each vuln to an advisory with canonical_key =
+        # PkgIdentifier.BOMRef. When present it is the vuln source; --trivy-json is then misconfig-only.
+        if os.path.exists(os.path.join(t, "trivy-sbom.json")):
+            args += ["--trivy-sbom-json", "/in/trivy-sbom.json"]
+        if os.path.exists(os.path.join(t, "zizmor.sarif")):
+            args += ["--sarif", "/in/zizmor.sarif:zizmor"]
+        # qscan's post-quantum crypto findings (SARIF) and CBOM (CycloneDX 1.6).
+        if os.path.exists(os.path.join(t, "qscan.sarif")):
+            args += ["--qscan-sarif", "/in/qscan.sarif"]
+        if os.path.exists(os.path.join(t, "qscan.cbom.json")):
+            args += ["--qscan-cbom", "/in/qscan.cbom.json"]
+        if os.path.exists(os.path.join(t, "findings.json")):
+            args += ["--findings", "/in/findings.json"]
+        db = tdb or sdb  # fs and sbom pull the same vuln-DB; use whichever ran
+        if db:
+            args += ["--db-snapshot", db]
+        args += ["--tool", f"trivy:{tv}:{tdb}:{ts}"]
+        args += ["--tool", f"zizmor:{zv}:{zdb}:{zs}"]
+        args += ["--tool", f"trivy-sbom:{sv}:{sdb}:{ss}"]
+        args += ["--tool", f"qscan:{qv}:{qdb}:{qs}"]
+        print("\n".join(args))
+        PY
+        mapfile -t NARGS < "$RUNNER_TEMP/nargs"
+        nout="$RUNNER_TEMP/nout"; mkdir -p "$nout"
+        # Same sandbox shape the engine runs in: no network, non-root, read-only root, caps dropped.
+        # Pulls on the @sha256 digest pin with NO verify (Gate C: a digest is a content hash, so this
+        # is the same bytes the scan job already attested). normalize drops any SEC-tripping row
+        # itself; it never touches share or any hash.
+        docker pull --quiet "$ENGINE_IMAGE" > /dev/null
+        docker run --rm --network none --user "$(id -u):$(id -g)" --read-only \
+          --tmpfs /tmp:rw,noexec,nosuid,size=64m --cap-drop ALL --security-opt no-new-privileges \
+          --memory 512m --memory-swap 512m --pids-limit 64 \
+          -v "$PWD/tools:/in:ro" -v "$nout:/out" "$ENGINE_IMAGE" \
+          normalize --repository-id "$REPOSITORY_ID" --run-id "$RUN_ID" \
+            "${NARGS[@]}" --out /out/envelope.json
+        [ -s "$nout/envelope.json" ] || { echo "::warning::normalize produced no envelope"; exit 1; }
+        cp "$nout/envelope.json" tool-envelope.json # present only on success; the body step keys off it
+
+    - name: Assemble the settletop.dossier-scan/2 body
+      shell: bash
+      env:
+        DOOR: ${{ inputs.door }}
+        SUBJECT_JSON: ${{ inputs.subject_json }}
+        SCAN_RUN_ID: ${{ inputs.scan_run_id }}
+        RUN_STARTED_AT: ${{ inputs.run_started_at }} # #330: whole-run wall -> run_meta.total_ms
+        MAX_ENVELOPE_BYTES: ${{ inputs.max_envelope_bytes }}
+      run: |
+        set -euo pipefail
+        # `report` is the engine share.json VERBATIM (same bytes a no-tool run posts). `envelope` is
+        # the SEPARATE tool posture, added only when normalize produced one; it rides in this SAME
+        # body and the registry links it to the share by the check id the share ingest returns. The
+        # subject is door-authored (passed in); identity is bound server-side, the subject is a match
+        # check only. run_meta (total_ms, step_times) is NOT hashed, so these never move share_sha256.
+        python3 -I - <<'PY'
+        import json, os
+        from datetime import datetime, timezone
+        e = os.environ
+        report = json.load(open("report/share.json", encoding="utf-8"))
+        # #330 + #382: stamp timing onto the engine-emitted run_metrics ONLY (never fabricate a dict,
+        # never zero-fill an unmeasured step; spec invariant 10). total_ms is the true wall; the tool
+        # steps run PARALLEL to the engine, so step_times is a where-the-time-goes map, not a timeline.
+        rm = (report.get("run_meta") or {}).get("run_metrics")
+        if isinstance(rm, dict):
+            started = e.get("RUN_STARTED_AT")
+            if started:
+                try:
+                    t0 = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                    total_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
+                    if total_ms >= 0:
+                        rm["total_ms"] = total_ms
+                except Exception:
+                    pass
+            def _read(path):
+                try:
+                    return json.load(open(path, encoding="utf-8"))
+                except Exception:
+                    return {}
+            steps = {}
+            # door-timing.json carries whatever the engine job measured: clone_ms (opensource) or
+            # setup_ms (private), plus pull_ms + scan_wall_ms. Copy every non-negative int key, so the
+            # per-door key (clone_ms vs setup_ms) flows through without this action knowing the door.
+            for k, v in _read("report/door-timing.json").items():
+                if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                    steps[k] = v
+            for fname, key in (("tools-trivy.json", "trivy_ms"), ("tools-zizmor.json", "zizmor_ms"),
+                               ("tools-qscan.json", "qscan_ms"), ("tools-trivy-sbom.json", "trivy_sbom_ms")):
+                v = _read(os.path.join("tools", fname)).get("ms")
+                if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                    steps[key] = v
+            u0 = e.get("UPLOAD_T0")
+            if u0:
+                try:
+                    upload_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - int(u0)
+                    if upload_ms >= 0:
+                        steps["upload_ms"] = upload_ms
+                except Exception:
+                    pass
+            if steps:
+                rm["step_times"] = steps
+        body = {
+            "schema": "settletop.dossier-scan/2",
+            "subject": json.loads(e["SUBJECT_JSON"]),
+            "report": report,
+        }
+        srid = e.get("SCAN_RUN_ID") or ""
+        if srid:  # opensource: the single-use token rides in the body (repo/commit matched server-side)
+            body["scan_run_id"] = srid
+        dump = lambda o: json.dumps(o, separators=(",", ":"), ensure_ascii=False)
+        if os.path.exists("tool-envelope.json"):
+            env_obj = json.load(open("tool-envelope.json", encoding="utf-8"))
+            # Byte-cap guard (#826): normalize dedupes but does NOT cap, so cap the advisory list here.
+            # Keep the most severe, drop the rest, and LOG the count (never silent).
+            cap = int(e["MAX_ENVELOPE_BYTES"])
+            advs = env_obj.get("advisories", [])
+            rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+            ordered = sorted(advs, key=lambda a: rank.get(a.get("severity"), 5))
+            lo, hi = 0, len(ordered)
+            while lo < hi:  # largest worst-first prefix whose envelope fits the cap
+                mid = (lo + hi + 1) // 2
+                if len(dump({**env_obj, "advisories": ordered[:mid]}).encode()) <= cap:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            env_obj["advisories"] = ordered[:lo]
+            if len(dump(env_obj).encode()) <= cap:
+                body["envelope"] = env_obj
+                if lo < len(advs):
+                    print(f"::warning::tool envelope over the {cap}-byte cap; kept the {lo} most "
+                          f"severe of {len(advs)} advisories, dropped {len(advs) - lo}")
+            else:
+                print(f"::warning::tool envelope exceeds the {cap}-byte cap even with no advisories; "
+                      f"posting the core dossier without it")
+        with open("payload.json", "w", encoding="utf-8") as f:
+            f.write(dump(body))
+        PY
+
+    - name: Mint the OIDC id-token and POST the report to the callback
+      id: post
+      shell: bash
+      env:
+        AUDIENCE: ${{ inputs.audience }}
+        CALLBACK_URL: ${{ inputs.callback_url }}
+        IDEMPOTENCY_KEY: ${{ inputs.idempotency_key }}
+      run: |
+        set -euo pipefail
+        # 1. GitHub identity token for the fixed audience. Masked before it is used anywhere.
+        oidc=$(curl -fsS --get --data-urlencode "audience=$AUDIENCE" \
+          -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" |
+          python3 -I -c 'import json,sys; print(json.load(sys.stdin)["value"])')
+        echo "::add-mask::$oidc"
+        # 2. POST. The bearer goes through curl's stdin config, not argv. Not --fail, so the body can
+        # show. Gzip: a big repo's dossier exceeds the serverless request-body cap (~4.5MB)
+        # uncompressed; the route reads Content-Encoding and inflates before parsing. TLS still
+        # encrypts the wire. Idempotency-Key is sent only when the door supplied one (private).
+        gzip -c payload.json > payload.json.gz
+        hdr=(-H 'Content-Type: application/json' -H 'Content-Encoding: gzip')
+        [ -n "$IDEMPOTENCY_KEY" ] && hdr+=(-H "Idempotency-Key: $IDEMPOTENCY_KEY")
+        status=$(printf 'header = "Authorization: Bearer %s"\n' "$oidc" | curl -K - -sS --proto '=https' \
+          --tlsv1.2 --max-time 120 --retry 2 -X POST \
+          "${hdr[@]}" \
+          --data-binary @payload.json.gz -o response.json -w '%{http_code}' "$CALLBACK_URL")
+        if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
+          echo "::error::ingest callback returned HTTP $status: $(head -c 500 response.json | tr -d '\r\n')"
+          exit 1
+        fi
+        echo "shared=true" >> "$GITHUB_OUTPUT"
+        echo "Shared the dossier (HTTP $status)." >> "$GITHUB_STEP_SUMMARY"
