@@ -77,6 +77,24 @@ jobs:
           print(f"OK: {len(actions)} composite actions, every run step sets shell: bash")
           PY
 
+      - name: Engine digest is single-sourced per door (#394 drift guard)
+        # Each door must pin the engine image on exactly ONE line (the ENGINE_IMAGE env); every run-engine
+        # and build-and-post call then reads that one value, so the scan digest and the normalize/validate
+        # digest cannot drift. A second literal anywhere in a door fails here.
+        run: |
+          set -euo pipefail
+          fail=0
+          for door in private-door opensource-door; do
+            f=".github/workflows/$door.yml"
+            n=$(grep -cE 'ghcr\.io/settletop-inc/dossier-engine@sha256:[0-9a-f]{64}' "$f" || true)
+            if [ "$n" -ne 1 ]; then
+              echo "::error::$f pins the engine image on $n lines, expected exactly 1 (single-source via the ENGINE_IMAGE env)"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: each door pins the engine image on exactly one line"
+
   run-tool-zizmor:
     runs-on: ubuntu-latest
     timeout-minutes: 10
