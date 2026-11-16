@@ -105,11 +105,13 @@ jobs:
           INPUT_COMMIT: ${{ inputs.commit }}
         run: |
           set -euo pipefail
+          t0=$(date +%s%3N) # #382 clone wall; carried to the engine step via $GITHUB_ENV
           git init -q clone
           git -C clone remote add origin "https://github.com/${INPUT_REPO}.git"
           git -C clone -c protocol.version=2 fetch -q --depth 1 origin "${INPUT_COMMIT}"
           git -C clone checkout -q FETCH_HEAD
           mkdir -p out
+          echo "CLONE_MS=$(( $(date +%s%3N) - t0 ))" >> "$GITHUB_ENV"
 
       - name: Verify the engine image's build provenance
         # Reject any engine image not built by our signer workflow BEFORE it runs (issue #298).
@@ -148,7 +150,9 @@ jobs:
           set -euo pipefail
           log="$RUNNER_TEMP/engine.log" # engine output stays on this runner, never the live log
           extra=(); [ -z "$ENGINE_COMMIT" ] || extra=(--engine-commit "$ENGINE_COMMIT")
+          t_pull=$(date +%s%3N) # #382 engine pull + run walls (best-effort, envelope-only timing)
           docker pull --quiet "$ENGINE_IMAGE" > /dev/null
+          t_run=$(date +%s%3N)
           cname="dossier-engine-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           # Heartbeat ticker (#318 pair, registry PR #1006): analyze is the long SILENT phase, so with no
           # ping the reaper's no-heartbeat clock would fail a live run. While the engine CONTAINER is
@@ -198,12 +202,19 @@ jobs:
             > "$log" 2>&1
           status=$?
           set -e
+          t_end=$(date +%s%3N) # #382 engine docker-run wall
           if [ "$status" -ne 0 ]; then
             echo "::error::the engine exited with status $status (its log stays on the runner and is not printed)"
             exit 1
           fi
           [ -s out/share.json ] || { echo "::error::the engine did not write share.json"; exit 1; }
           [ -s out/findings.json ] || { echo "::error::the engine did not write findings.json"; exit 1; }
+          # #382 per-step walls for the scan-time breakdown, carried in the report artifact. Best-effort
+          # and envelope-only: a write failure here must never fail the scan, and this never touches
+          # share.json or any hash. The engine's own phase timers (read/rules/analyze/taint/linker) ride
+          # in share.json's run_meta.run_metrics already.
+          printf '{"clone_ms":%s,"pull_ms":%s,"scan_wall_ms":%s}' \
+            "${CLONE_MS:-0}" "$(( t_run - t_pull ))" "$(( t_end - t_run ))" > out/door-timing.json || true
 
       - name: Pass the report on (1-day artifact)
         id: upload
@@ -272,6 +283,7 @@ jobs:
           TRIVY_PASSWORD: ${{ github.token }} # authed ghcr.io/aquasecurity/trivy-db pull
         run: |
           set -uo pipefail
+          t0=$(date +%s%3N) # #382 tool scan wall (parallel to the engine)
           out="$RUNNER_TEMP/out"; mkdir -p "$out"
           cache="$RUNNER_TEMP/trivy-cache"
           status=skipped; db_snapshot=""
@@ -292,8 +304,8 @@ jobs:
           else
             echo "::warning::Trivy is not installed (download failed); status=skipped"
           fi
-          python3 -I -c 'import json,sys; json.dump({"name":"trivy","version":sys.argv[1],"db_snapshot":sys.argv[2],"status":sys.argv[3]}, open(sys.argv[4],"w"))' \
-            "$TRIVY_VERSION" "$db_snapshot" "$status" "$out/tools-trivy.json"
+          python3 -I -c 'import json,sys; json.dump({"name":"trivy","version":sys.argv[1],"db_snapshot":sys.argv[2],"status":sys.argv[3],"ms":int(sys.argv[5])}, open(sys.argv[4],"w"))' \
+            "$TRIVY_VERSION" "$db_snapshot" "$status" "$out/tools-trivy.json" "$(( $(date +%s%3N) - t0 ))"
           echo "Trivy $TRIVY_VERSION: status=$status db_snapshot=${db_snapshot:-none}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Pass the tool output on (1-day artifact)
@@ -343,6 +355,7 @@ jobs:
           GH_TOKEN: ${{ github.token }} # zizmor's online audits query the GitHub API
         run: |
           set -uo pipefail
+          t0=$(date +%s%3N) # #382 tool scan wall (parallel to the engine)
           out="$RUNNER_TEMP/out"; mkdir -p "$out"
           status=skipped
           if [ -d clone/.github/workflows ]; then
@@ -357,8 +370,8 @@ jobs:
           else
             echo "::notice::no .github/workflows to scan; zizmor status=skipped"
           fi
-          python3 -I -c 'import json,sys; json.dump({"name":"zizmor","version":sys.argv[1],"db_snapshot":"","status":sys.argv[2]}, open(sys.argv[3],"w"))' \
-            "$ZIZMOR_VERSION" "$status" "$out/tools-zizmor.json"
+          python3 -I -c 'import json,sys; json.dump({"name":"zizmor","version":sys.argv[1],"db_snapshot":"","status":sys.argv[2],"ms":int(sys.argv[4])}, open(sys.argv[3],"w"))' \
+            "$ZIZMOR_VERSION" "$status" "$out/tools-zizmor.json" "$(( $(date +%s%3N) - t0 ))"
           echo "zizmor $ZIZMOR_VERSION: status=$status" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Pass the tool output on (1-day artifact)
@@ -411,6 +424,7 @@ jobs:
         continue-on-error: true
         run: |
           set -uo pipefail
+          t0=$(date +%s%3N) # #382 tool scan wall (parallel to the engine)
           out="$RUNNER_TEMP/out"; mkdir -p "$out"
           status=skipped
           # npx runs the version-pinned qscan ephemerally; npm's integrity sha512 content-pins the
@@ -431,8 +445,8 @@ jobs:
                "$out/qscan.cbom.json" 2>/dev/null; then
             rm -f "$out/qscan.cbom.json"
           fi
-          python3 -I -c 'import json,sys; json.dump({"name":"qscan","version":sys.argv[1],"db_snapshot":"","status":sys.argv[2]}, open(sys.argv[3],"w"))' \
-            "$QSCAN_VERSION" "$status" "$out/tools-qscan.json"
+          python3 -I -c 'import json,sys; json.dump({"name":"qscan","version":sys.argv[1],"db_snapshot":"","status":sys.argv[2],"ms":int(sys.argv[4])}, open(sys.argv[3],"w"))' \
+            "$QSCAN_VERSION" "$status" "$out/tools-qscan.json" "$(( $(date +%s%3N) - t0 ))"
           echo "qscan $QSCAN_VERSION: status=$status" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Pass the tool output on (1-day artifact)
@@ -498,6 +512,7 @@ jobs:
           TRIVY_PASSWORD: ${{ github.token }} # authed ghcr.io/aquasecurity/trivy-db pull
         run: |
           set -uo pipefail
+          t0=$(date +%s%3N) # #382 tool scan wall (runs after the engine, beside the upload)
           out="$RUNNER_TEMP/out"; mkdir -p "$out"
           cache="$RUNNER_TEMP/trivy-cache"
           bom="report/bom.trivy.cdx.json" # the engine's 1.6 Trivy-facing BOM, not the 1.7 AI-BOM
@@ -522,8 +537,8 @@ jobs:
           else
             echo "::warning::Trivy is not installed (download failed); status=skipped"
           fi
-          python3 -I -c 'import json,sys; json.dump({"name":"trivy-sbom","version":sys.argv[1],"db_snapshot":sys.argv[2],"status":sys.argv[3]}, open(sys.argv[4],"w"))' \
-            "$TRIVY_VERSION" "$db_snapshot" "$status" "$out/tools-trivy-sbom.json"
+          python3 -I -c 'import json,sys; json.dump({"name":"trivy-sbom","version":sys.argv[1],"db_snapshot":sys.argv[2],"status":sys.argv[3],"ms":int(sys.argv[5])}, open(sys.argv[4],"w"))' \
+            "$TRIVY_VERSION" "$db_snapshot" "$status" "$out/tools-trivy-sbom.json" "$(( $(date +%s%3N) - t0 ))"
           echo "Trivy SBOM $TRIVY_VERSION: status=$status db_snapshot=${db_snapshot:-none}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Pass the tool output on (1-day artifact)
@@ -559,6 +574,7 @@ jobs:
           PHASE: uploading
         run: |
           set -uo pipefail # best effort: a ping must NEVER fail a scan
+          echo "UPLOAD_T0=$(date +%s%3N)" >> "$GITHUB_ENV" # #382 upload-job wall (download + normalize + POST)
           jq -n --arg srid "$SCAN_RUN_ID" --arg repo "$INPUT_REPO" --arg commit "$INPUT_COMMIT" --arg phase "$PHASE" \
             '{scan_run_id:$srid, subject:{repo:$repo, commit:$commit}, phase:$phase}' > progress.json
           curl -sS --proto '=https' --tlsv1.2 --max-time 20 -X POST \
@@ -671,16 +687,48 @@ jobs:
           # the run_meta envelope so the dossier shows the real scan time, not just the engine's
           # read+analyze slice. run_meta is NOT hashed (share_sha256 covers the share block only), so this
           # never affects ingest verification. Only added to an engine-emitted run_metrics, never fabricated.
+          rm = (report.get("run_meta") or {}).get("run_metrics")
           started = e.get("RUN_STARTED_AT")
-          if started:
+          if started and isinstance(rm, dict):
               try:
                   t0 = datetime.fromisoformat(started.replace("Z", "+00:00"))
                   total_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
-                  rm = (report.get("run_meta") or {}).get("run_metrics")
-                  if isinstance(rm, dict) and total_ms >= 0:
+                  if total_ms >= 0:
                       rm["total_ms"] = total_ms
               except Exception:
                   pass
+          # #382: the per-step walls for the scan-time breakdown, merged into the SAME run_meta envelope
+          # (never hashed). These are MEASURED step durations, and the tool steps run PARALLEL to the
+          # engine, so step_times is a where-the-time-goes map, NOT an additive timeline; total_ms above
+          # is the true wall. Best-effort: any piece that is missing is simply left out, and a failure
+          # here never blocks the POST.
+          if isinstance(rm, dict):
+              def _read(path):
+                  try:
+                      return json.load(open(path, encoding="utf-8"))
+                  except Exception:
+                      return {}
+              steps = {}
+              dt = _read("report/door-timing.json")
+              for k in ("clone_ms", "pull_ms", "scan_wall_ms"):
+                  v = dt.get(k)
+                  if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                      steps[k] = v
+              for fname, key in (("tools-trivy.json", "trivy_ms"), ("tools-zizmor.json", "zizmor_ms"),
+                                 ("tools-qscan.json", "qscan_ms"), ("tools-trivy-sbom.json", "trivy_sbom_ms")):
+                  v = _read(os.path.join("tools", fname)).get("ms")
+                  if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                      steps[key] = v
+              u0 = e.get("UPLOAD_T0")
+              if u0:
+                  try:
+                      upload_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - int(u0)
+                      if upload_ms >= 0:
+                          steps["upload_ms"] = upload_ms
+                  except Exception:
+                      pass
+              if steps:
+                  rm["step_times"] = steps
           body = {
               "schema": "settletop.dossier-scan/2",
               "scan_run_id": e["SCAN_RUN_ID"],
