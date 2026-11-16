@@ -95,6 +95,34 @@ jobs:
           [ "$fail" -eq 0 ] || exit 1
           echo "OK: each door pins the engine image on exactly one line"
 
+      - name: Shared actions are referenced by full path, pinned to one SHA per door
+        # A door is a REUSABLE workflow called from the customer's repo, so `uses: ./.github/actions/*`
+        # would resolve against the CUSTOMER's checkout (not this repo) and fail. The doors must call the
+        # shared actions by full path `SettleTop-Inc/settletop-dossier-workflow/.github/actions/*@<sha>`,
+        # pinned to a 40-hex commit SHA, all the same SHA within a door.
+        # shortcut: changing an action's behavior needs a follow-up PR bumping this pinned SHA; the
+        # action-smoke `wiring`/`run-tool` jobs only exercise the in-repo copy, not the pinned ref.
+        run: |
+          set -euo pipefail
+          fail=0
+          for door in private-door opensource-door; do
+            f=".github/workflows/$door.yml"
+            total=$(grep -coE 'settletop-dossier-workflow/\.github/actions/[a-z-]+@' "$f" || true)
+            pinned=$(grep -oE 'settletop-dossier-workflow/\.github/actions/[a-z-]+@[0-9a-f]{40}' "$f" || true)
+            npinned=$(printf '%s\n' "$pinned" | grep -c . || true)
+            if [ "$total" -ne "$npinned" ]; then
+              echo "::error::$f has a shared-action ref not pinned to a 40-hex SHA (or still uses ./)"
+              fail=1
+            fi
+            nsha=$(printf '%s\n' "$pinned" | sed -E 's/.*@//' | sort -u | grep -c . || true)
+            if [ "$total" -gt 0 ] && [ "$nsha" -ne 1 ]; then
+              echo "::error::$f pins shared actions to $nsha different SHAs, expected exactly 1"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: both doors reference the shared actions by full path, one pinned SHA each"
+
   run-tool-zizmor:
     runs-on: ubuntu-latest
     timeout-minutes: 10
