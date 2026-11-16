@@ -70,7 +70,7 @@ inputs:
     description: "'clone' (opensource) or 'setup' (private) -- selects the door-timing.json fetch key (clone_ms vs setup_ms)."
     required: true
   gh_token:
-    description: A GITHUB_TOKEN for `gh attestation verify` (needs the job's packages:read). Pass ${{ github.token }}.
+    description: A GITHUB_TOKEN for `gh attestation verify` (needs the job's packages:read). The door passes its github.token (no braces in this text; GitHub evaluates expressions in action metadata).
     required: true
 
 outputs:

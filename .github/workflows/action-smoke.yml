@@ -71,6 +71,16 @@ jobs:
               for i, step in enumerate(runs.get("steps", [])):
                   if "run" in step and step.get("shell") != "bash":
                       bad.append(f"{path}: step {i} ({step.get('name','?')}) has a run block without shell: bash")
+              # GitHub evaluates template expressions in action input metadata (description/default) at
+              # load time, where most contexts (github, secrets, ...) are unavailable, so the action fails
+              # to load. The smoke jobs never load run-engine/build-and-post, so only this static check
+              # catches it. The marker is built from parts so this workflow's own run body has no token.
+              expr = "$" + "{{"
+              for name, spec in (doc.get("inputs") or {}).items():
+                  for field in ("description", "default"):
+                      val = spec.get(field)
+                      if isinstance(val, str) and expr in val:
+                          bad.append(f"{path}: input '{name}' {field} has a template expression; move it out of metadata (GitHub evaluates it at load and the action fails to load)")
           if bad:
               print("\n".join(f"::error::{m}" for m in bad))
               sys.exit(1)
@@ -173,11 +183,13 @@ jobs:
           print(f"OK: zizmor status={d['status']} ms={d['ms']}")
           PY
 
-  # Lint-only wiring proof for run-engine + build-and-post. This job NEVER runs: no commit SHA equals
-  # the sentinel. It exists so actionlint type-checks that every required input of those two actions is
-  # supplied by a real call, without needing the engine image, a licence, or an OIDC mint.
+  # Load run-engine + build-and-post so GitHub VALIDATES their manifests. actionlint and the structural
+  # check cannot catch a load-time template error (e.g. ${{ }} in an input's metadata); only GitHub's own
+  # manifest load does, and it runs at job prep for every action the job uses. The two action steps are
+  # continue-on-error: they fail at RUNTIME here (no engine image, no licence, no real OIDC), but the
+  # manifests are loaded at prep first, so a bad manifest fails the job while an execution failure does not.
+  # It also type-checks that every required input of those two actions is supplied by a real call.
   wiring:
-    if: ${{ github.sha == 'lint-only-never-runs' }}
     runs-on: ubuntu-latest
     permissions:
       packages: read
@@ -190,6 +202,7 @@ jobs:
 
       - name: run-engine wiring (private-shaped call)
         uses: ./.github/actions/run-engine
+        continue-on-error: true # manifest loads at prep; the step itself fails (no engine/licence/OIDC)
         with:
           engine_image: ghcr.io/settletop-inc/dossier-engine@sha256:0000000000000000000000000000000000000000000000000000000000000000
           engine_memory: 4g
@@ -205,6 +218,7 @@ jobs:
 
       - name: build-and-post wiring (private-shaped call)
         uses: ./.github/actions/build-and-post
+        continue-on-error: true # manifest loads at prep; the step itself fails (no artifacts/OIDC)
         with:
           door: private
           callback_url: https://registry.settletop.com/api/ingest/scan
