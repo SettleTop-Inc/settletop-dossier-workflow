@@ -87,7 +87,7 @@ permissions: {}
 # it, so the image we attest is exactly the image we run and normalize. NONE of these is a
 # workflow_call input -- a customer caller could otherwise forge the engine image or pin a tool.
 env:
-  ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:e1d634511fb144aab2cf561be1ba4ab78566d64f1653c73c43722537c9528a61
+  ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:91e1d0d04c4e738b1b05fc465a6a377c69975ec00fc8883d1ff1f36351066bc4
   TRIVY_VERSION: "0.76.2" # TODO(infra): bump to the current Trivy release
   ZIZMOR_VERSION: "1.32.0" # TODO(infra): bump to the current zizmor release
   QSCAN_VERSION: "0.12.0" # TODO(infra): bump to the current @quantakrypto/qscan release
