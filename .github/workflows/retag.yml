@@ -3,6 +3,11 @@
 # engine-digest bump reaches consumers. The engine image stays digest-pinned INSIDE the door files;
 # only the ref `v1` moves. The opensource OIDC verify matches `...opensource-door.yml@refs/tags/v1`,
 # which does not change when the tag moves, so no Vercel edit is ever needed.
+#
+# Revert (#413): before each move, the current v1 target is kept as `v1-prev`, so an emergency rollback
+# is one `workflow_dispatch` with rollback=true. That is a TAG-ONLY move: `main` still carries the bad
+# digest, so a later door push would move v1 forward onto it again. The real fix is `git revert` of the
+# bad bump commit on main, which re-fires this workflow and moves v1 back with files + tag together.
 name: Move v1
 
 on:
@@ -12,6 +17,11 @@ on:
       - ".github/workflows/private-door.yml"
       - ".github/workflows/opensource-door.yml"
   workflow_dispatch:
+    inputs:
+      rollback:
+        description: "Emergency: move v1 back to v1-prev (tag only; revert the bump commit for the real fix)."
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -25,8 +35,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Force-move v1 to this commit
+        with:
+          fetch-depth: 0   # need the existing v1 / v1-prev tags to read and move them
+      - name: Move v1 (or roll back to v1-prev)
+        env:
+          ROLLBACK: ${{ inputs.rollback }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          git tag -f v1 "$GITHUB_SHA"
+          if [ "${ROLLBACK:-false}" = "true" ]; then
+            target=$(git rev-parse -q --verify refs/tags/v1-prev) \
+              || { echo "::error::no v1-prev tag to roll back to"; exit 1; }
+            echo "rollback: moving v1 to v1-prev ($target)"
+          else
+            # Keep the current v1 target as v1-prev before moving, so a bad move is one dispatch from revert.
+            old=$(git rev-parse -q --verify refs/tags/v1 || true)
+            if [ -n "$old" ]; then
+              git tag -f v1-prev "$old"
+              git push -f origin "refs/tags/v1-prev"
+            fi
+            target="$SHA"
+          fi
+          git tag -f v1 "$target"
           git push -f origin "refs/tags/v1"
