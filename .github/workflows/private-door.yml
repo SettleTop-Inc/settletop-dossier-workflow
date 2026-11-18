@@ -17,21 +17,21 @@
 #       # TODO(infra): replace with the published workflow repo + a pinned tag or SHA.
 #       uses: SettleTop-Inc/TODO-infra-workflow-repo/.github/workflows/private-door.yml@TODO-infra-ref
 #       permissions:              # the caller must grant the UNION of what the jobs below ask for;
-#         id-token: write         #   licence + share (each job then gets only its own slice)
-#         contents: write         #   keep-release only; check and the rest stay at read
+#         id-token: write         #   licence + upload (each job then gets only its own slice)
+#         contents: write         #   keep-release only; scan and the rest stay at read
 #         checks: write           #   keep-checks
 #         security-events: write  #   keep-security-tab
-#         packages: read          #   check (engine attestation) + tools-trivy (authed vuln-DB pull)
+#         packages: read          #   scan (engine attestation) + tools-trivy (authed vuln-DB pull)
 #         actions: write          #   cleanup (spec 4.2: the caller's own token, never the App)
 #       with:
 #         keep: summary,artifact  # summary,checks,artifact,security-tab,release,none
 #         share: registry         # or none (default)
 #
-# JOBS (spec 4.2): [fork guard] -> licence -> check -> keep* / share -> cleanup.
+# JOBS (spec 4.2): [fork guard] -> licence -> scan -> keep* / upload -> cleanup.
 #   licence  id-token: write only. Trades GitHub's identity token for a short-lived licence.
-#   check    contents: read only, NO identity token. Sandboxed engine, no network.
+#   scan     contents: read only, NO identity token. Sandboxed engine, no network.
 #   keep*    one job per output, each with only the permission that output needs.
-#   share    id-token: write only. Validates the report, POSTs the share view to the registry.
+#   upload   id-token: write only. Validates the report, POSTs the share view to the registry.
 #   cleanup  actions: write only, if: always(). Deletes the licence + report transfer artifacts.
 #
 # Reusable workflows cannot vary a job's permissions at run time, so the spec's single
@@ -73,10 +73,10 @@ on:
     outputs:
       shared:
         description: "true if the share view was uploaded to the registry."
-        value: ${{ jobs.share.outputs.shared }}
+        value: ${{ jobs.upload.outputs.shared }}
       share-sha256:
         description: sha256 of the share block (spec 9.2), when shared.
-        value: ${{ jobs.share.outputs.share-sha256 }}
+        value: ${{ jobs.upload.outputs.share-sha256 }}
 
 # Deny by default; every job states exactly what it needs.
 permissions: {}
@@ -88,9 +88,12 @@ permissions: {}
 # workflow_call input -- a customer caller could otherwise forge the engine image or pin a tool.
 env:
   ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:91e1d0d04c4e738b1b05fc465a6a377c69975ec00fc8883d1ff1f36351066bc4
-  TRIVY_VERSION: "0.76.2" # TODO(infra): bump to the current Trivy release
-  ZIZMOR_VERSION: "1.32.0" # TODO(infra): bump to the current zizmor release
-  QSCAN_VERSION: "0.12.0" # TODO(infra): bump to the current @quantakrypto/qscan release
+  ENGINE_COMMIT: "" # engine source commit for run_meta; empty records "Unknown"
+  ENGINE_MEMORY: 4g
+  INGEST_AUDIENCE: https://ingest.settletop.com
+  TRIVY_VERSION: "0.76.2" # TODO(infra): bump to the current Trivy release; keep in step with the open-source door
+  ZIZMOR_VERSION: "1.32.0" # TODO(infra): bump to the current zizmor release; keep in step with the open-source door
+  QSCAN_VERSION: "0.12.0" # TODO(infra): bump to the current @quantakrypto/qscan release; keep in step with the open-source door
 
 defaults:
   run:
@@ -191,11 +194,12 @@ jobs:
         run: rm -f "$RUNNER_TEMP/licence/licence.txt" "$RUNNER_TEMP/licence/response.json"
 
   # ---------------------------------------------------------------------------
-  # check. contents: read only, NO identity token. The engine runs in a sandbox
+  # scan. contents: read only, NO identity token. The engine runs in a sandbox
   # with no network and reads files from the git tree object (the engine lists the
-  # tree and reads blobs; it never walks the working tree).
+  # tree and reads blobs; it never walks the working tree). Named `scan` to match the
+  # open-source door's engine job (same shared run-engine action).
   # ---------------------------------------------------------------------------
-  check:
+  scan:
     needs: licence
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -209,10 +213,10 @@ jobs:
       commit-sha: ${{ steps.engine.outputs.commit-sha }}
       run-started-at: ${{ steps.runstart.outputs.at }}
     steps:
-      - name: Mark run start (#330 total_ms whole-run wall; #382 setup_ms timer)
+      - name: Mark run start (#330 whole-run wall -> run_meta.total_ms; #382 setup_ms timer)
         id: runstart
         # github.run_started_at is not a real context field (resolves empty). Stamp the job start as a
-        # job output so the share job (a separate job) can read it; $GITHUB_ENV would not cross jobs.
+        # job output so the upload job (a separate job) can read it; $GITHUB_ENV would not cross jobs.
         # SETUP_T0 opens the #382 setup-phase timer (checkout + licence fetch), read back below.
         run: |
           echo "at=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" >> "$GITHUB_OUTPUT"
@@ -250,7 +254,8 @@ jobs:
         uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-engine@608a610ed33e73423232b1fa3f5bafa74dceb5c1
         with:
           engine_image: ${{ env.ENGINE_IMAGE }}
-          engine_memory: 4g
+          engine_memory: ${{ env.ENGINE_MEMORY }}
+          engine_commit: ${{ env.ENGINE_COMMIT }}
           source_dir: ${{ github.workspace }}
           commit: ${{ steps.setup.outputs.commit }}
           require_licence: "true"
@@ -267,18 +272,18 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dossier-report-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/out
+          path: ${{ steps.engine.outputs.out-dir }}
           retention-days: 1
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
   # tools-trivy / tools-zizmor (#317, epic #310). OSS deploy scanners that run in
-  # PARALLEL to `check` (no `needs`), so they add ~no wall-clock. They send NOTHING
+  # PARALLEL to `scan` (no `needs`), so they add ~no wall-clock. They send NOTHING
   # out: each writes its findings file + a one-line tools-*.json (name/version/
-  # db_snapshot/status) to a 1-day transfer artifact that `share` folds into the
+  # db_snapshot/status) to a 1-day transfer artifact that `upload` folds into the
   # tool envelope with the engine's `normalize`. Decoupled by design - every tool
   # error SOFT-FAILS to status `skipped` (a blocked vuln-DB pull, a crash, no
-  # workflows), so a scanner NEVER fails the dossier. Gated exactly like `share`
+  # workflows), so a scanner NEVER fails the dossier. Gated exactly like `upload`
   # (fork guard + share==registry): the envelope only goes to the registry, so a
   # run that will not share has nothing to scan for.
   # ---------------------------------------------------------------------------
@@ -305,8 +310,6 @@ jobs:
           tool: trivy
           source_dir: .
           trivy_version: ${{ env.TRIVY_VERSION }}
-          zizmor_version: ${{ env.ZIZMOR_VERSION }}
-          qscan_version: ${{ env.QSCAN_VERSION }}
 
       - name: Pass the tool output on (1-day artifact)
         id: upload
@@ -339,9 +342,7 @@ jobs:
         with:
           tool: zizmor
           source_dir: .
-          trivy_version: ${{ env.TRIVY_VERSION }}
           zizmor_version: ${{ env.ZIZMOR_VERSION }}
-          qscan_version: ${{ env.QSCAN_VERSION }}
 
       - name: Pass the tool output on (1-day artifact)
         id: upload
@@ -357,7 +358,7 @@ jobs:
   # tools-qscan (#364, epic #310). OSS post-quantum crypto scanner
   # (@quantakrypto/qscan). Scans the source tree for quantum-vulnerable crypto and
   # emits a SARIF report plus a CycloneDX 1.6 CBOM. PARALLEL to scan, soft-fails to
-  # `skipped` like tools-zizmor; `share` folds qscan.sarif + qscan.cbom.json into the
+  # `skipped` like tools-zizmor; `upload` folds qscan.sarif + qscan.cbom.json into the
   # tool envelope via the engine's --qscan-sarif / --qscan-cbom flags.
   # ---------------------------------------------------------------------------
   tools-qscan:
@@ -381,8 +382,6 @@ jobs:
         with:
           tool: qscan
           source_dir: .
-          trivy_version: ${{ env.TRIVY_VERSION }}
-          zizmor_version: ${{ env.ZIZMOR_VERSION }}
           qscan_version: ${{ env.QSCAN_VERSION }}
 
       - name: Pass the tool output on (1-day artifact)
@@ -402,15 +401,15 @@ jobs:
   # tools-trivy: that one scans the source tree (deploy posture), this one scans
   # bom.trivy.cdx.json (the engine's CycloneDX 1.6 BOM written by --trivy-bom-out;
   # Trivy rejects the 1.7 AI-BOM bom.cdx.json). It NEEDS the engine output, so it runs
-  # AFTER `check` (not in parallel) and downloads the report artifact for that BOM. It
+  # AFTER `scan` (not in parallel) and downloads the report artifact for that BOM. It
   # runs in its OWN job so the Trivy vuln-DB pull never widens the engine job's network
-  # surface. Soft-fails to `skipped` like tools-trivy; `share` folds trivy-sbom.json into
-  # the envelope via the engine's `normalize`. Gated like `share` (fork guard + share==
+  # surface. Soft-fails to `skipped` like tools-trivy; `upload` folds trivy-sbom.json into
+  # the envelope via the engine's `normalize`. Gated like `upload` (fork guard + share==
   # registry): a run that will not share has nothing to map.
   # ---------------------------------------------------------------------------
   tools-trivy-sbom:
-    if: ${{ !cancelled() && github.event.pull_request.head.repo.fork != true && inputs.share == 'registry' && needs.check.result == 'success' }}
-    needs: check
+    if: ${{ !cancelled() && github.event.pull_request.head.repo.fork != true && inputs.share == 'registry' && needs.scan.result == 'success' }}
+    needs: scan
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -421,7 +420,7 @@ jobs:
       - name: Fetch the report (for bom.trivy.cdx.json)
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          artifact-ids: ${{ needs.check.outputs.report-artifact-id }}
+          artifact-ids: ${{ needs.scan.outputs.report-artifact-id }}
           path: report
           merge-multiple: true
 
@@ -434,8 +433,6 @@ jobs:
           tool: trivy-sbom
           bom_path: report/bom.trivy.cdx.json
           trivy_version: ${{ env.TRIVY_VERSION }}
-          zizmor_version: ${{ env.ZIZMOR_VERSION }}
-          qscan_version: ${{ env.QSCAN_VERSION }}
 
       - name: Pass the tool output on (1-day artifact)
         id: upload
@@ -453,7 +450,7 @@ jobs:
   # ---------------------------------------------------------------------------
   keep:
     # summary + artifact need no token permission.
-    needs: check
+    needs: scan
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions: {}
@@ -461,7 +458,7 @@ jobs:
       - name: Fetch the report
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          artifact-ids: ${{ needs.check.outputs.report-artifact-id }}
+          artifact-ids: ${{ needs.scan.outputs.report-artifact-id }}
           path: report
           merge-multiple: true
 
@@ -512,7 +509,7 @@ jobs:
 
   keep-checks:
     if: contains(format(',{0},', inputs.keep), ',checks,')
-    needs: check
+    needs: scan
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -521,7 +518,7 @@ jobs:
       - name: Fetch the report
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          artifact-ids: ${{ needs.check.outputs.report-artifact-id }}
+          artifact-ids: ${{ needs.scan.outputs.report-artifact-id }}
           path: report
           merge-multiple: true
 
@@ -530,7 +527,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           # On a PR, annotate the PR head so the check shows on the pull request.
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || needs.check.outputs.commit-sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || needs.scan.outputs.commit-sha }}
         run: |
           set -euo pipefail
           python3 -I - <<'PY'
@@ -570,7 +567,7 @@ jobs:
 
   keep-security-tab:
     if: contains(format(',{0},', inputs.keep), ',security-tab,')
-    needs: check
+    needs: scan
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -581,7 +578,7 @@ jobs:
       - name: Fetch the report
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          artifact-ids: ${{ needs.check.outputs.report-artifact-id }}
+          artifact-ids: ${{ needs.scan.outputs.report-artifact-id }}
           path: report
           merge-multiple: true
       # Private repos need GitHub Code Security for this to be accepted.
@@ -593,7 +590,7 @@ jobs:
 
   keep-release:
     if: contains(format(',{0},', inputs.keep), ',release,')
-    needs: check
+    needs: scan
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -602,7 +599,7 @@ jobs:
       - name: Fetch the report
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          artifact-ids: ${{ needs.check.outputs.report-artifact-id }}
+          artifact-ids: ${{ needs.scan.outputs.report-artifact-id }}
           path: report
           merge-multiple: true
       # Only works while the release is still a draft/unpublished: with immutable releases
@@ -620,7 +617,7 @@ jobs:
           gh release upload "$TAG" dossier-report.tar.gz --repo "$REPOSITORY" --clobber
 
   # ---------------------------------------------------------------------------
-  # share (spec 4.2.2). id-token: write only. Validates the report, then POSTs the
+  # upload (spec 4.2.2). id-token: write only. Validates the report, then POSTs the
   # settletop.dossier-scan/2 envelope to the registry ingest, authenticated by a
   # GitHub OIDC token with a fixed audience (the registry pins aud, the numeric
   # repository_id / repository_owner_id and job_workflow_ref server-side).
@@ -631,13 +628,13 @@ jobs:
   # The tool envelope is BEST-EFFORT and rides in the SAME upload body as a top-level
   # `envelope` key (the registry links it to the share by the check id the share
   # ingest returns; there is no separate advisory endpoint). It never touches `report`
-  # or any hash. `needs` the scanners only to ORDER after them; `if` runs share even
+  # or any hash. `needs` the scanners only to ORDER after them; `if` runs upload even
   # when a scanner failed/was skipped, so the core dossier upload is never blocked by
   # a scanner (spec #310/#318: a tool failure loses only the CVE posture).
   # ---------------------------------------------------------------------------
-  share:
-    if: ${{ !cancelled() && inputs.share == 'registry' && needs.check.result == 'success' }}
-    needs: [check, tools-trivy, tools-zizmor, tools-trivy-sbom, tools-qscan]
+  upload:
+    if: ${{ !cancelled() && inputs.share == 'registry' && needs.scan.result == 'success' }}
+    needs: [scan, tools-trivy, tools-zizmor, tools-trivy-sbom, tools-qscan]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -649,7 +646,7 @@ jobs:
       - name: Download the report by artifact id
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          artifact-ids: ${{ needs.check.outputs.report-artifact-id }}
+          artifact-ids: ${{ needs.scan.outputs.report-artifact-id }}
           path: report
           merge-multiple: true
 
@@ -658,11 +655,11 @@ jobs:
         env:
           # ENGINE_IMAGE comes from the workflow-level env (single source, #394).
           MAX_BYTES: ${{ inputs.max-share-bytes }}
-          EXPECT_SHA256: ${{ needs.check.outputs.share-file-sha256 }}
-          EXPECT_BYTES: ${{ needs.check.outputs.share-file-bytes }}
+          EXPECT_SHA256: ${{ needs.scan.outputs.share-file-sha256 }}
+          EXPECT_BYTES: ${{ needs.scan.outputs.share-file-bytes }}
         run: |
           set -euo pipefail
-          # 1. The file is the one `check` wrote (digest + size), under the cap, and the share
+          # 1. The file is the one `scan` wrote (digest + size), under the cap, and the share
           #    block hashes to its own share_sha256 (compact, sorted-key JSON: the byte form the
           #    engine hashes, spec 9.2).
           python3 -I - <<'PY'
@@ -674,7 +671,7 @@ jobs:
           if len(raw) > int(os.environ["MAX_BYTES"]):
               fail("share view is over the size cap (outcome: truncated); not uploaded")
           if len(raw) != int(os.environ["EXPECT_BYTES"]) or hashlib.sha256(raw).hexdigest() != os.environ["EXPECT_SHA256"]:
-              fail("share view does not match the digest or size recorded by check")
+              fail("share view does not match the digest or size recorded by scan")
           env = json.loads(raw)
           share = env.get("share")
           if not isinstance(share, dict) or "share_sha256" not in env:
@@ -711,7 +708,7 @@ jobs:
           REF: ${{ github.ref }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
-          COMMIT_SHA: ${{ needs.check.outputs.commit-sha }}
+          COMMIT_SHA: ${{ needs.scan.outputs.commit-sha }}
         run: |
           set -euo pipefail
           python3 -I - <<'PY' >> "$GITHUB_OUTPUT"
@@ -740,13 +737,13 @@ jobs:
         with:
           door: private
           callback_url: https://registry.settletop.com/api/ingest/scan
-          audience: https://ingest.settletop.com
+          audience: ${{ env.INGEST_AUDIENCE }}
           engine_image: ${{ env.ENGINE_IMAGE }}
-          report_artifact_id: ${{ needs.check.outputs.report-artifact-id }}
+          report_artifact_id: ${{ needs.scan.outputs.report-artifact-id }}
           tools_artifact_pattern: dossier-tools-*-${{ github.run_id }}-${{ github.run_attempt }}
           subject_json: ${{ steps.subject.outputs.json }}
-          run_started_at: ${{ needs.check.outputs.run-started-at }}
-          max_envelope_bytes: "4194304" # TODO(infra): 4 MiB. The whole POST body stays under this.
+          run_started_at: ${{ needs.scan.outputs.run-started-at }}
+          max_envelope_bytes: "4194304" # 4 MiB. The whole POST body stays under this.
           idempotency_key: ${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   # ---------------------------------------------------------------------------
@@ -757,7 +754,7 @@ jobs:
   # ---------------------------------------------------------------------------
   cleanup:
     if: always() && needs.licence.result != 'skipped'
-    needs: [licence, check, tools-trivy, tools-zizmor, tools-trivy-sbom, tools-qscan, keep, keep-checks, keep-security-tab, keep-release, share]
+    needs: [licence, scan, tools-trivy, tools-zizmor, tools-trivy-sbom, tools-qscan, keep, keep-checks, keep-security-tab, keep-release, upload]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -769,7 +766,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           # An id is empty when its job never got as far as uploading (e.g. a skipped scanner).
           IDS: >-
-            ${{ needs.licence.outputs.artifact-id }} ${{ needs.check.outputs.report-artifact-id }}
+            ${{ needs.licence.outputs.artifact-id }} ${{ needs.scan.outputs.report-artifact-id }}
             ${{ needs.tools-trivy.outputs.artifact-id }} ${{ needs.tools-zizmor.outputs.artifact-id }}
             ${{ needs.tools-trivy-sbom.outputs.artifact-id }} ${{ needs.tools-qscan.outputs.artifact-id }}
         run: |
