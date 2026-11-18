@@ -7,11 +7,11 @@ jobs:
   dossier:
     uses: SettleTop-Inc/settletop-dossier-workflow/.github/workflows/private-door.yml@v1
     permissions:
-      id-token: write         # licence + share
+      id-token: write         # licence + upload
       contents: write         # keep: release
       checks: write           # keep: checks
       security-events: write  # keep: security-tab
-      packages: read          # check (engine attestation) + tools-trivy (authed vuln-DB pull)
+      packages: read          # scan (engine attestation) + tools-trivy (authed vuln-DB pull)
       actions: write          # cleanup
     with:
       share: registry

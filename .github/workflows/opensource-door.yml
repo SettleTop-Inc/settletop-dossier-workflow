@@ -52,6 +52,9 @@ env:
   ENGINE_COMMIT: "" # engine source commit for run_meta; empty records "Unknown"
   ENGINE_MEMORY: 4g
   INGEST_AUDIENCE: https://ingest.settletop.com
+  TRIVY_VERSION: "0.76.2" # TODO(infra): bump to the current Trivy release; keep in step with the private door
+  ZIZMOR_VERSION: "1.32.0" # TODO(infra): bump to the current zizmor release; keep in step with the private door
+  QSCAN_VERSION: "0.12.0" # TODO(infra): bump to the current @quantakrypto/qscan release; keep in step with the private door
   CALLBACK_URL: https://registry.settletop.com/api/ingest/opensource-scan
   # Live-progress ping endpoint. The open-source run lives in the host repo, so GitHub's
   # workflow_run webhook never reaches the scanned-repo scan_run row; these pings move the bar.
@@ -79,7 +82,7 @@ jobs:
       report-artifact-id: ${{ steps.upload.outputs.artifact-id }}
       run-started-at: ${{ steps.runstart.outputs.at }}
     steps:
-      - name: Mark run start (#330 whole-run wall time -> run_meta.total_ms)
+      - name: Mark run start (#330 whole-run wall -> run_meta.total_ms)
         id: runstart
         # github.run_started_at is not a real context field (resolves empty). Stamp the job start as a
         # job output so the upload job (a separate job) can read it; $GITHUB_ENV would not cross jobs.
@@ -172,7 +175,7 @@ jobs:
           nohup bash "$RUNNER_TEMP/heartbeat.sh" > /dev/null 2>&1 &
           disown
 
-      - name: Run the engine (verify provenance + pinned sandbox scan)
+      - name: Run the dossier engine
         id: engine
         uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-engine@608a610ed33e73423232b1fa3f5bafa74dceb5c1
         with:
@@ -190,7 +193,7 @@ jobs:
         id: upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: dossier-os-report-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dossier-report-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.engine.outputs.out-dir }}
           retention-days: 1
           if-no-files-found: error
@@ -205,8 +208,6 @@ jobs:
     timeout-minutes: 15
     permissions:
       packages: read # authed ghcr pull of the Trivy vuln-DB (dodge the anon rate limit)
-    env:
-      TRIVY_VERSION: "0.76.2" # TODO(infra): bump to the current Trivy release; keep in step with the private door
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
@@ -231,7 +232,7 @@ jobs:
           git -C clone -c protocol.version=2 fetch -q --depth 1 origin "${INPUT_COMMIT}"
           git -C clone checkout -q FETCH_HEAD
 
-      - name: Run Trivy (fs vuln + misconfig; soft-fail to skipped)
+      - name: Run the OSS scanner (trivy)
         uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@608a610ed33e73423232b1fa3f5bafa74dceb5c1
         with:
           tool: trivy
@@ -243,7 +244,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: dossier-os-tools-trivy-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dossier-tools-trivy-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/out
           retention-days: 1
           if-no-files-found: error # tools-trivy.json is always written, so this never trips
@@ -252,8 +253,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions: {}
-    env:
-      ZIZMOR_VERSION: "1.32.0" # TODO(infra): bump to the current zizmor release; keep in step with the private door
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
@@ -278,7 +277,7 @@ jobs:
           git -C clone -c protocol.version=2 fetch -q --depth 1 origin "${INPUT_COMMIT}"
           git -C clone checkout -q FETCH_HEAD
 
-      - name: Run zizmor (workflow SARIF; soft-fail to skipped)
+      - name: Run the OSS scanner (zizmor)
         uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@608a610ed33e73423232b1fa3f5bafa74dceb5c1
         with:
           tool: zizmor
@@ -290,7 +289,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: dossier-os-tools-zizmor-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dossier-tools-zizmor-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/out
           retention-days: 1
           if-no-files-found: error # tools-zizmor.json is always written, so this never trips
@@ -299,8 +298,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions: {}
-    env:
-      QSCAN_VERSION: "0.12.0" # TODO(infra): bump to the current @quantakrypto/qscan release; keep in step with the private door
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
@@ -325,7 +322,7 @@ jobs:
           git -C clone -c protocol.version=2 fetch -q --depth 1 origin "${INPUT_COMMIT}"
           git -C clone checkout -q FETCH_HEAD
 
-      - name: Run qscan (post-quantum crypto SARIF + CBOM; soft-fail to skipped)
+      - name: Run the OSS scanner (qscan)
         uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@608a610ed33e73423232b1fa3f5bafa74dceb5c1
         with:
           tool: qscan
@@ -337,7 +334,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: dossier-os-tools-qscan-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dossier-tools-qscan-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/out
           retention-days: 1
           if-no-files-found: error # tools-qscan.json is always written, so this never trips
@@ -359,8 +356,6 @@ jobs:
     timeout-minutes: 15
     permissions:
       packages: read # authed ghcr pull of the Trivy vuln-DB (dodge the anon rate limit)
-    env:
-      TRIVY_VERSION: "0.76.2" # TODO(infra): bump to the current Trivy release; keep in step with the private door
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
@@ -371,7 +366,7 @@ jobs:
           path: report
           merge-multiple: true
 
-      - name: Run Trivy on the engine BOM (CVEs; soft-fail to skipped)
+      - name: Run the OSS scanner (trivy-sbom)
         uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@608a610ed33e73423232b1fa3f5bafa74dceb5c1
         with:
           tool: trivy-sbom
@@ -383,7 +378,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: dossier-os-tools-trivy-sbom-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dossier-tools-trivy-sbom-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/out
           retention-days: 1
           if-no-files-found: error # tools-trivy-sbom.json is always written, so this never trips
@@ -417,7 +412,7 @@ jobs:
           curl -sS --proto '=https' --tlsv1.2 --max-time 20 -X POST \
             -H 'Content-Type: application/json' --data-binary @progress.json "$PROGRESS_URL" > /dev/null || true
 
-      - name: Build and post the open-source dossier
+      - name: Build and post the dossier
         uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/build-and-post@608a610ed33e73423232b1fa3f5bafa74dceb5c1
         with:
           door: opensource
@@ -425,7 +420,7 @@ jobs:
           audience: ${{ env.INGEST_AUDIENCE }}
           engine_image: ${{ env.ENGINE_IMAGE }}
           report_artifact_id: ${{ needs.scan.outputs.report-artifact-id }}
-          tools_artifact_pattern: dossier-os-tools-*-${{ github.run_id }}-${{ github.run_attempt }}
+          tools_artifact_pattern: dossier-tools-*-${{ github.run_id }}-${{ github.run_attempt }}
           subject_json: '{"repo":${{ toJSON(inputs.repo) }},"commit":${{ toJSON(inputs.commit) }},"unit_path":null}'
           run_started_at: ${{ needs.scan.outputs.run-started-at }}
           max_envelope_bytes: "4194304" # 4 MiB. The whole POST body stays under this.
