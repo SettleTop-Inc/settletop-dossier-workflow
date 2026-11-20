@@ -177,7 +177,7 @@ jobs:
 
       - name: Run the dossier engine
         id: engine
-        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-engine@608a610ed33e73423232b1fa3f5bafa74dceb5c1
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-engine@f8a853a50b8169e34f5681f0452b6efea373ec00
         with:
           engine_image: ${{ env.ENGINE_IMAGE }}
           engine_memory: ${{ env.ENGINE_MEMORY }}
@@ -233,7 +233,7 @@ jobs:
           git -C clone checkout -q FETCH_HEAD
 
       - name: Run the OSS scanner (trivy)
-        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@608a610ed33e73423232b1fa3f5bafa74dceb5c1
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@f8a853a50b8169e34f5681f0452b6efea373ec00
         with:
           tool: trivy
           source_dir: clone
@@ -278,7 +278,7 @@ jobs:
           git -C clone checkout -q FETCH_HEAD
 
       - name: Run the OSS scanner (zizmor)
-        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@608a610ed33e73423232b1fa3f5bafa74dceb5c1
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@f8a853a50b8169e34f5681f0452b6efea373ec00
         with:
           tool: zizmor
           source_dir: clone
@@ -323,7 +323,7 @@ jobs:
           git -C clone checkout -q FETCH_HEAD
 
       - name: Run the OSS scanner (qscan)
-        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@608a610ed33e73423232b1fa3f5bafa74dceb5c1
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@f8a853a50b8169e34f5681f0452b6efea373ec00
         with:
           tool: qscan
           source_dir: clone
@@ -367,7 +367,7 @@ jobs:
           merge-multiple: true
 
       - name: Run the OSS scanner (trivy-sbom)
-        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@608a610ed33e73423232b1fa3f5bafa74dceb5c1
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@f8a853a50b8169e34f5681f0452b6efea373ec00
         with:
           tool: trivy-sbom
           bom_path: report/bom.trivy.cdx.json
@@ -413,7 +413,7 @@ jobs:
             -H 'Content-Type: application/json' --data-binary @progress.json "$PROGRESS_URL" > /dev/null || true
 
       - name: Build and post the dossier
-        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/build-and-post@608a610ed33e73423232b1fa3f5bafa74dceb5c1
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/build-and-post@f8a853a50b8169e34f5681f0452b6efea373ec00
         with:
           door: opensource
           callback_url: ${{ env.CALLBACK_URL }}
