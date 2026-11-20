@@ -8,6 +8,13 @@
 # is one `workflow_dispatch` with rollback=true. That is a TAG-ONLY move: `main` still carries the bad
 # digest, so a later door push would move v1 forward onto it again. The real fix is `git revert` of the
 # bad bump commit on main, which re-fires this workflow and moves v1 back with files + tag together.
+#
+# Both pushes need a token carrying the `workflows` permission (WORKFLOW_REPO_BUMP_TOKEN: the same App
+# token/PAT the engine repo uses to write the door files here). The built-in GITHUB_TOKEN cannot: GitHub
+# refuses a GitHub App push of a ref whose `.github/workflows` content differs from the default branch,
+# and both doors ARE workflow files. It bites `v1-prev` first, which by design points at the PREVIOUS
+# door content, and `set -e` then skips the `v1` push: the bump sits on main and v1 never moves. That
+# shipped nothing on 2026-11-20 until #429's engine image was re-pointed by hand.
 name: Move v1
 
 on:
@@ -34,9 +41,20 @@ jobs:
   retag:
     runs-on: ubuntu-latest
     steps:
+      # Fail loudly on a missing token: without it the pair half-moves and the engine never ships.
+      - name: Require a workflow-scoped token
+        env:
+          TOKEN: ${{ secrets.WORKFLOW_REPO_BUMP_TOKEN }}
+        run: |
+          [ -n "$TOKEN" ] || {
+            echo "::error::WORKFLOW_REPO_BUMP_TOKEN is unset, so v1 cannot move. Add the App token or PAT the engine repo already uses, with contents:write AND workflows:write on this repo."
+            exit 1
+          }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0   # need the existing v1 / v1-prev tags to read and move them
+          token: ${{ secrets.WORKFLOW_REPO_BUMP_TOKEN }}
+          persist-credentials: true   # keep that token as the credential for the tag pushes below
       - name: Move v1 (or roll back to v1-prev)
         env:
           ROLLBACK: ${{ inputs.rollback }}
