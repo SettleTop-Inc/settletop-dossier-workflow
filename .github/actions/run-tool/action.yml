@@ -126,6 +126,16 @@ runs:
             else
               rm -f "$out/trivy.json"
             fi
+            # 3. Filesystem SBOM document (CycloneDX; the engine adds VEX later and captures it via
+            #    --trivy-sbom-cdx). Vuln scanner only (secret + misconfig off: a BOM is inventory, not
+            #    findings); the DB is already pulled, so --skip-db-update. Independent of the scan above
+            #    and soft: a failure leaves no file and never flips `status`. A valid empty-inventory doc
+            #    (unlocked repo) is kept; only a zero-byte crash artifact is dropped.
+            if ! { trivy fs --scanners vuln --format cyclonedx --skip-db-update \
+                 --cache-dir "$cache" --timeout 10m --output "$out/sbom.cdx.json" "$SOURCE_DIR" 2> "$RUNNER_TEMP/trivy-cdx.log" \
+               && [ -s "$out/sbom.cdx.json" ]; }; then
+              rm -f "$out/sbom.cdx.json"
+            fi
           else
             echo "::warning::Trivy vuln-DB pull failed; status=skipped (dossier unaffected)"
           fi
