@@ -127,6 +127,11 @@ runs:
         # PkgIdentifier.BOMRef. When present it is the vuln source; --trivy-json is then misconfig-only.
         if os.path.exists(os.path.join(t, "trivy-sbom.json")):
             args += ["--trivy-sbom-json", "/in/trivy-sbom.json"]
+        # The filesystem SBOM DOCUMENT (Trivy CycloneDX from run-tool). Distinct from --trivy-sbom-json
+        # above (that is the engine-BOM CVE scan): this is the captured sbom-fs doc the engine emits
+        # verbatim, VEX added there. normalize reads it via --trivy-sbom-cdx.
+        if os.path.exists(os.path.join(t, "sbom.cdx.json")):
+            args += ["--trivy-sbom-cdx", "/in/sbom.cdx.json"]
         if os.path.exists(os.path.join(t, "zizmor.sarif")):
             args += ["--sarif", "/in/zizmor.sarif:zizmor"]
         # qscan's post-quantum crypto findings (SARIF) and CBOM (CycloneDX 1.6).
