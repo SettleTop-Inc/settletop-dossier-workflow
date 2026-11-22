@@ -345,7 +345,7 @@ jobs:
   # tools-pssa (#501, epic #498). OSS PowerShell scanner (PSScriptAnalyzer -> SARIF). Scans the
   # tokenless clone's .ps1/.psm1/.psd1, PARALLEL to scan, soft-fails to `skipped` like tools-zizmor;
   # build-and-post folds psscriptanalyzer.sarif into the tool envelope via --sarif ...:psscriptanalyzer.
-  # (InjectionHunter is held until its licence is confirmed; the engine already handles both sources.)
+  # (InjectionHunter, a 2018 unmaintained module, is deliberately not used; PSScriptAnalyzer is the maintained source.)
   # ---------------------------------------------------------------------------
   tools-pssa:
     runs-on: ubuntu-latest

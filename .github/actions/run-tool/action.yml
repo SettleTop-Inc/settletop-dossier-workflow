@@ -264,8 +264,8 @@ runs:
         # Only when the tree has PowerShell and pwsh (PowerShell Core) is on the runner. PSScriptAnalyzer
         # + ConvertToSARIF are pinned PowerShell Gallery modules installed per run (CurrentUser scope, no
         # global leakage). The analyzer exits 0 even with findings, so a SARIF with a `runs` array means
-        # `ok`; no pwsh / blocked install / crash soft-fails to `skipped`. InjectionHunter is intentionally
-        # NOT loaded (its licence is unconfirmed); this step emits only the `psscriptanalyzer` source.
+        # `ok`; no pwsh / blocked install / crash soft-fails to `skipped`. Only the maintained
+        # `psscriptanalyzer` source is emitted (InjectionHunter, a 2018 unmaintained module, is not used).
         if command -v pwsh > /dev/null \
            && find "$SOURCE_DIR" -type f \( -iname '*.ps1' -o -iname '*.psm1' -o -iname '*.psd1' \) -print -quit | grep -q .; then
           pwsh -NoProfile -NonInteractive -Command '
