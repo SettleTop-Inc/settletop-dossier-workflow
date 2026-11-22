@@ -120,6 +120,7 @@ runs:
         zv, zdb, zs = meta("tools-zizmor.json", "zizmor")
         sv, sdb, ss = meta("tools-trivy-sbom.json", "trivy-sbom")  # AI-BOM CVE scan (#826)
         qv, qdb, qs = meta("tools-qscan.json", "qscan")  # post-quantum crypto scan (#364)
+        pv, pdb, ps = meta("tools-psscriptanalyzer.json", "psscriptanalyzer")  # PowerShell SAST (#501)
         args = []
         if os.path.exists(os.path.join(t, "trivy.json")):
             args += ["--trivy-json", "/in/trivy.json"]
@@ -134,6 +135,9 @@ runs:
             args += ["--trivy-sbom-cdx", "/in/sbom.cdx.json"]
         if os.path.exists(os.path.join(t, "zizmor.sarif")):
             args += ["--sarif", "/in/zizmor.sarif:zizmor"]
+        # PowerShell SAST (#501): PSScriptAnalyzer SARIF, the same source-tagged --sarif path as zizmor.
+        if os.path.exists(os.path.join(t, "psscriptanalyzer.sarif")):
+            args += ["--sarif", "/in/psscriptanalyzer.sarif:psscriptanalyzer"]
         # qscan's post-quantum crypto findings (SARIF) and CBOM (CycloneDX 1.6).
         if os.path.exists(os.path.join(t, "qscan.sarif")):
             args += ["--qscan-sarif", "/in/qscan.sarif"]
@@ -148,6 +152,7 @@ runs:
         args += ["--tool", f"zizmor:{zv}:{zdb}:{zs}"]
         args += ["--tool", f"trivy-sbom:{sv}:{sdb}:{ss}"]
         args += ["--tool", f"qscan:{qv}:{qdb}:{qs}"]
+        args += ["--tool", f"psscriptanalyzer:{pv}:{pdb}:{ps}"]
         print("\n".join(args))
         PY
         mapfile -t NARGS < "$RUNNER_TEMP/nargs"
@@ -213,7 +218,8 @@ runs:
                 if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
                     steps[k] = v
             for fname, key in (("tools-trivy.json", "trivy_ms"), ("tools-zizmor.json", "zizmor_ms"),
-                               ("tools-qscan.json", "qscan_ms"), ("tools-trivy-sbom.json", "trivy_sbom_ms")):
+                               ("tools-qscan.json", "qscan_ms"), ("tools-trivy-sbom.json", "trivy_sbom_ms"),
+                               ("tools-psscriptanalyzer.json", "pssa_ms")):
                 v = _read(os.path.join("tools", fname)).get("ms")
                 if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
                     steps[key] = v

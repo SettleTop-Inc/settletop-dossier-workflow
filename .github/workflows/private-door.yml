@@ -94,6 +94,8 @@ env:
   TRIVY_VERSION: "0.76.2" # TODO(infra): bump to the current Trivy release; keep in step with the open-source door
   ZIZMOR_VERSION: "1.32.0" # TODO(infra): bump to the current zizmor release; keep in step with the open-source door
   QSCAN_VERSION: "0.12.0" # TODO(infra): bump to the current @quantakrypto/qscan release; keep in step with the open-source door
+  PSSA_VERSION: "1.22.0" # PSScriptAnalyzer (PowerShell SAST); keep in step with the open-source door
+  CONVERTSARIF_VERSION: "1.0.0" # ConvertToSARIF (PSScriptAnalyzer -> SARIF); keep in step with the open-source door
 
 defaults:
   run:
@@ -395,6 +397,46 @@ jobs:
           if-no-files-found: error # tools-qscan.json is always written, so this never trips
 
   # ---------------------------------------------------------------------------
+  # tools-pssa (#501, epic #498). OSS PowerShell scanner (PSScriptAnalyzer -> SARIF). Scans the
+  # checkout's .ps1/.psm1/.psd1, PARALLEL to scan, soft-fails to `skipped` like tools-zizmor;
+  # `upload` folds psscriptanalyzer.sarif into the tool envelope via --sarif ...:psscriptanalyzer.
+  # (InjectionHunter, a 2018 unmaintained module, is deliberately not used; PSScriptAnalyzer is the maintained source.)
+  # ---------------------------------------------------------------------------
+  tools-pssa:
+    if: ${{ github.event.pull_request.head.repo.fork != true && inputs.share == 'registry' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # check out the commit to scan
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run the OSS scanner (pssa)
+        # Shared action: the pwsh PSScriptAnalyzer scan lives in run-tool, soft-failing to `skipped`
+        # and stamping the tool meta. source_dir is the checkout `.`.
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@33c2625cdc680f71da690d7646599b36453212be
+        with:
+          tool: pssa
+          source_dir: .
+          pssa_version: ${{ env.PSSA_VERSION }}
+          convertsarif_version: ${{ env.CONVERTSARIF_VERSION }}
+
+      - name: Pass the tool output on (1-day artifact)
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dossier-tools-pssa-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/out
+          retention-days: 1
+          if-no-files-found: error # tools-psscriptanalyzer.json is always written, so this never trips
+
+  # ---------------------------------------------------------------------------
   # tools-trivy-sbom (#826, epic #823). Scans the ENGINE's Trivy-facing BOM for known
   # CVEs so every versioned component carries its advisories (canonical_key = the
   # component bom-ref = Trivy's PkgIdentifier.BOMRef). This is a DIFFERENT scan from
@@ -634,7 +676,7 @@ jobs:
   # ---------------------------------------------------------------------------
   upload:
     if: ${{ !cancelled() && inputs.share == 'registry' && needs.scan.result == 'success' }}
-    needs: [scan, tools-trivy, tools-zizmor, tools-trivy-sbom, tools-qscan]
+    needs: [scan, tools-trivy, tools-zizmor, tools-trivy-sbom, tools-qscan, tools-pssa]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -754,7 +796,7 @@ jobs:
   # ---------------------------------------------------------------------------
   cleanup:
     if: always() && needs.licence.result != 'skipped'
-    needs: [licence, scan, tools-trivy, tools-zizmor, tools-trivy-sbom, tools-qscan, keep, keep-checks, keep-security-tab, keep-release, upload]
+    needs: [licence, scan, tools-trivy, tools-zizmor, tools-trivy-sbom, tools-qscan, tools-pssa, keep, keep-checks, keep-security-tab, keep-release, upload]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -769,6 +811,7 @@ jobs:
             ${{ needs.licence.outputs.artifact-id }} ${{ needs.scan.outputs.report-artifact-id }}
             ${{ needs.tools-trivy.outputs.artifact-id }} ${{ needs.tools-zizmor.outputs.artifact-id }}
             ${{ needs.tools-trivy-sbom.outputs.artifact-id }} ${{ needs.tools-qscan.outputs.artifact-id }}
+            ${{ needs.tools-pssa.outputs.artifact-id }}
         run: |
           set -uo pipefail
           for id in $IDS; do

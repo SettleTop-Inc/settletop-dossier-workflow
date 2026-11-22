@@ -55,6 +55,8 @@ env:
   TRIVY_VERSION: "0.76.2" # TODO(infra): bump to the current Trivy release; keep in step with the private door
   ZIZMOR_VERSION: "1.32.0" # TODO(infra): bump to the current zizmor release; keep in step with the private door
   QSCAN_VERSION: "0.12.0" # TODO(infra): bump to the current @quantakrypto/qscan release; keep in step with the private door
+  PSSA_VERSION: "1.22.0" # PSScriptAnalyzer (PowerShell SAST); keep in step with the private door
+  CONVERTSARIF_VERSION: "1.0.0" # ConvertToSARIF (PSScriptAnalyzer -> SARIF); keep in step with the private door
   CALLBACK_URL: https://registry.settletop.com/api/ingest/opensource-scan
   # Live-progress ping endpoint. The open-source run lives in the host repo, so GitHub's
   # workflow_run webhook never reaches the scanned-repo scan_run row; these pings move the bar.
@@ -340,6 +342,58 @@ jobs:
           if-no-files-found: error # tools-qscan.json is always written, so this never trips
 
   # ---------------------------------------------------------------------------
+  # tools-pssa (#501, epic #498). OSS PowerShell scanner (PSScriptAnalyzer -> SARIF). Scans the
+  # tokenless clone's .ps1/.psm1/.psd1, PARALLEL to scan, soft-fails to `skipped` like tools-zizmor;
+  # build-and-post folds psscriptanalyzer.sarif into the tool envelope via --sarif ...:psscriptanalyzer.
+  # (InjectionHunter, a 2018 unmaintained module, is deliberately not used; PSScriptAnalyzer is the maintained source.)
+  # ---------------------------------------------------------------------------
+  tools-pssa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Validate the scan target
+        env:
+          INPUT_REPO: ${{ inputs.repo }}
+          INPUT_COMMIT: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+          fail(){ echo "::error::$1"; exit 1; }
+          [[ "$INPUT_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || fail "repo must be owner/name"
+          [[ "$INPUT_COMMIT" =~ ^[0-9a-f]{7,40}$ ]] || fail "commit must be a hex SHA"
+
+      - name: Clone the public repo (tokenless) at the pinned commit
+        env:
+          INPUT_REPO: ${{ inputs.repo }}
+          INPUT_COMMIT: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+          git init -q clone
+          git -C clone remote add origin "https://github.com/${INPUT_REPO}.git"
+          git -C clone -c protocol.version=2 fetch -q --depth 1 origin "${INPUT_COMMIT}"
+          git -C clone checkout -q FETCH_HEAD
+
+      - name: Run the OSS scanner (pssa)
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@33c2625cdc680f71da690d7646599b36453212be
+        with:
+          tool: pssa
+          source_dir: clone
+          pssa_version: ${{ env.PSSA_VERSION }}
+          convertsarif_version: ${{ env.CONVERTSARIF_VERSION }}
+
+      - name: Pass the tool output on (1-day artifact)
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dossier-tools-pssa-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/out
+          retention-days: 1
+          if-no-files-found: error # tools-psscriptanalyzer.json is always written, so this never trips
+
+  # ---------------------------------------------------------------------------
   # tools-trivy-sbom (#826, epic #823). Scans the ENGINE's Trivy-facing BOM for known CVEs so
   # every versioned component carries its advisories (canonical_key = the component bom-ref =
   # Trivy's PkgIdentifier.BOMRef). Unlike tools-trivy (which scans the source clone for deploy
@@ -393,7 +447,7 @@ jobs:
   # ---------------------------------------------------------------------------
   upload:
     if: ${{ !cancelled() && needs.scan.result == 'success' }}
-    needs: [scan, tools-trivy, tools-zizmor, tools-trivy-sbom, tools-qscan]
+    needs: [scan, tools-trivy, tools-zizmor, tools-trivy-sbom, tools-qscan, tools-pssa]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
