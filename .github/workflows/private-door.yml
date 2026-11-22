@@ -87,7 +87,7 @@ permissions: {}
 # it, so the image we attest is exactly the image we run and normalize. NONE of these is a
 # workflow_call input -- a customer caller could otherwise forge the engine image or pin a tool.
 env:
-  ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:ab0d603ce09c0069031ebdc2fdff0fb010e4e3f229bd7fe04e97fd43043141f1
+  ENGINE_IMAGE: ghcr.io/settletop-inc/dossier-engine@sha256:55c53b9669ef39088ead4b88faeec459d0e57e71b5d1e4a17d1cabbadc7c12db
   ENGINE_COMMIT: "" # engine source commit for run_meta; empty records "Unknown"
   ENGINE_MEMORY: 4g
   INGEST_AUDIENCE: https://ingest.settletop.com
