@@ -253,7 +253,7 @@ jobs:
         # flags live inside run-engine. Private forces --require-licence (licence on stdin, a missing one
         # is a hard fail) and passes the setup-phase timing. source_dir's basename is the repo name, so
         # the engine still mounts /work/<repo> and facts_sha256 does not move.
-        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-engine@33c2625cdc680f71da690d7646599b36453212be
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-engine@0967f7fb084ba19f3c8a7db51b492c62171e388d
         with:
           engine_image: ${{ env.ENGINE_IMAGE }}
           engine_memory: ${{ env.ENGINE_MEMORY }}
@@ -307,7 +307,7 @@ jobs:
       - name: Run the OSS scanner (trivy)
         # Shared action (PR #53): the checksum-verified Trivy install + the fs vuln/misconfig scan live
         # in run-tool, soft-failing to `skipped` and stamping trivy_ms. source_dir is the checkout `.`.
-        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@33c2625cdc680f71da690d7646599b36453212be
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@0967f7fb084ba19f3c8a7db51b492c62171e388d
         with:
           tool: trivy
           source_dir: .
@@ -340,7 +340,7 @@ jobs:
       - name: Run the OSS scanner (zizmor)
         # Shared action (PR #53): the pipx zizmor workflow scan lives in run-tool, soft-failing to
         # `skipped` and stamping zizmor_ms. source_dir is the checkout `.`.
-        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@33c2625cdc680f71da690d7646599b36453212be
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@0967f7fb084ba19f3c8a7db51b492c62171e388d
         with:
           tool: zizmor
           source_dir: .
@@ -380,7 +380,7 @@ jobs:
       - name: Run the OSS scanner (qscan)
         # Shared action (PR #53): Node 20 setup + the qscan SARIF/CBOM crypto scan live in run-tool,
         # soft-failing to `skipped` and stamping qscan_ms. source_dir is the checkout `.`.
-        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@33c2625cdc680f71da690d7646599b36453212be
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@0967f7fb084ba19f3c8a7db51b492c62171e388d
         with:
           tool: qscan
           source_dir: .
@@ -419,7 +419,7 @@ jobs:
       - name: Run the OSS scanner (pssa)
         # Shared action: the pwsh PSScriptAnalyzer scan lives in run-tool, soft-failing to `skipped`
         # and stamping the tool meta. source_dir is the checkout `.`.
-        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@33c2625cdc680f71da690d7646599b36453212be
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@0967f7fb084ba19f3c8a7db51b492c62171e388d
         with:
           tool: pssa
           source_dir: .
@@ -470,7 +470,7 @@ jobs:
         # Shared action (PR #53): the Trivy install + the BOM CVE scan live in run-tool, soft-failing
         # to `skipped` and stamping trivy_sbom_ms. It reads the engine's 1.6 Trivy-facing BOM downloaded
         # above (not the 1.7 AI-BOM), so the door points bom_path at it.
-        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@33c2625cdc680f71da690d7646599b36453212be
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/run-tool@0967f7fb084ba19f3c8a7db51b492c62171e388d
         with:
           tool: trivy-sbom
           bom_path: report/bom.trivy.cdx.json
@@ -775,7 +775,7 @@ jobs:
       # workflow_call inputs). The validate gate above stays in the door. This job keeps id-token:write.
       - name: Build and post the dossier
         id: post
-        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/build-and-post@33c2625cdc680f71da690d7646599b36453212be
+        uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/build-and-post@0967f7fb084ba19f3c8a7db51b492c62171e388d
         with:
           door: private
           callback_url: https://registry.settletop.com/api/ingest/scan
