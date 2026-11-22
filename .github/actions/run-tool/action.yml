@@ -57,6 +57,14 @@ inputs:
     description: Pinned @quantakrypto/qscan release for `qscan` (current pinned value 0.12.0). The door supplies it when tool is qscan.
     required: false
     default: ""
+  pssa_version:
+    description: Pinned PSScriptAnalyzer release for `pssa` (current pinned value 1.22.0). The door supplies it when tool is pssa.
+    required: false
+    default: ""
+  convertsarif_version:
+    description: Pinned ConvertToSARIF release for `pssa` (current pinned value 1.0.0). The door supplies it when tool is pssa.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -68,8 +76,8 @@ runs:
       run: |
         set -euo pipefail
         case "$TOOL" in
-          trivy|zizmor|qscan|trivy-sbom) ;;
-          *) echo "::error::run-tool: unknown tool '$TOOL' (expected trivy|zizmor|qscan|trivy-sbom)"; exit 1 ;;
+          trivy|zizmor|qscan|trivy-sbom|pssa) ;;
+          *) echo "::error::run-tool: unknown tool '$TOOL' (expected trivy|zizmor|qscan|trivy-sbom|pssa)"; exit 1 ;;
         esac
 
     # Trivy binary, shared by `trivy` (source scan) and `trivy-sbom` (BOM CVE scan). Checksum-verified
@@ -239,6 +247,48 @@ runs:
         python3 -I -c 'import json,sys; json.dump({"name":"qscan","version":sys.argv[1],"db_snapshot":"","status":sys.argv[2],"ms":int(sys.argv[4])}, open(sys.argv[3],"w"))' \
           "$QSCAN_VERSION" "$status" "$out/tools-qscan.json" "$(( $(date +%s%3N) - t0 ))"
         echo "qscan $QSCAN_VERSION: status=$status" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: "pssa: scan PowerShell with PSScriptAnalyzer (SARIF; soft-fail to skipped)"
+      if: ${{ inputs.tool == 'pssa' }}
+      shell: bash
+      continue-on-error: true
+      env:
+        PSSA_VERSION: ${{ inputs.pssa_version }}
+        CONVERTSARIF_VERSION: ${{ inputs.convertsarif_version }}
+        SOURCE_DIR: ${{ inputs.source_dir }}
+      run: |
+        set -uo pipefail
+        t0=$(date +%s%3N) # #382 tool scan wall (parallel to the engine)
+        out="$RUNNER_TEMP/out"; mkdir -p "$out"
+        status=skipped
+        # Only when the tree has PowerShell and pwsh (PowerShell Core) is on the runner. PSScriptAnalyzer
+        # + ConvertToSARIF are pinned PowerShell Gallery modules installed per run (CurrentUser scope, no
+        # global leakage). The analyzer exits 0 even with findings, so a SARIF with a `runs` array means
+        # `ok`; no pwsh / blocked install / crash soft-fails to `skipped`. InjectionHunter is intentionally
+        # NOT loaded (its licence is unconfirmed); this step emits only the `psscriptanalyzer` source.
+        if command -v pwsh > /dev/null \
+           && find "$SOURCE_DIR" -type f \( -iname '*.ps1' -o -iname '*.psm1' -o -iname '*.psd1' \) -print -quit | grep -q .; then
+          pwsh -NoProfile -NonInteractive -Command '
+            $ErrorActionPreference = "Stop"
+            Install-Module PSScriptAnalyzer -RequiredVersion $env:PSSA_VERSION -Scope CurrentUser -Force -AcceptLicense
+            Install-Module ConvertToSARIF  -RequiredVersion $env:CONVERTSARIF_VERSION -Scope CurrentUser -Force -AcceptLicense
+            Import-Module PSScriptAnalyzer
+            Import-Module ConvertToSARIF
+            $r = Invoke-ScriptAnalyzer -Path $env:SOURCE_DIR -Recurse -Severity Error,Warning
+            @($r) | ConvertTo-SARIF -FilePath (Join-Path $env:RUNNER_TEMP "out/psscriptanalyzer.sarif")
+          ' > "$RUNNER_TEMP/pssa.log" 2>&1 || true
+          if python3 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("runs") is not None else 1)' \
+               "$out/psscriptanalyzer.sarif" 2>/dev/null; then
+            status=ok
+          else
+            rm -f "$out/psscriptanalyzer.sarif"
+          fi
+        else
+          echo "::notice::no PowerShell files or pwsh unavailable; pssa status=skipped"
+        fi
+        python3 -I -c 'import json,sys; json.dump({"name":"psscriptanalyzer","version":sys.argv[1],"db_snapshot":"","status":sys.argv[2],"ms":int(sys.argv[4])}, open(sys.argv[3],"w"))' \
+          "$PSSA_VERSION" "$status" "$out/tools-psscriptanalyzer.json" "$(( $(date +%s%3N) - t0 ))"
+        echo "PSScriptAnalyzer $PSSA_VERSION: status=$status" >> "$GITHUB_STEP_SUMMARY"
 
     - name: "trivy-sbom: scan the engine BOM for CVEs (soft-fail to skipped)"
       if: ${{ inputs.tool == 'trivy-sbom' }}
