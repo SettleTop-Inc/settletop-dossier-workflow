@@ -218,6 +218,72 @@ jobs:
           print(f"OK: zizmor status={d['status']} ms={d['ms']}")
           PY
 
+  # Proves the #447 chart-discovery prep: run-tool (trivy) must materialize a scan-only Chart.yaml beside
+  # a build-templated Chart-template.yaml so Trivy can discover first-party Helm charts, and must leave a
+  # chart that already has a real Chart.yaml untouched. The trivy install/scan themselves soft-fail here;
+  # the prep step runs first and is what this asserts, so no DB pull is required for the check to hold.
+  run-tool-trivy-helm-discovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read # authed ghcr pull of the Trivy vuln-DB, as the real door does
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Seed a build-templated chart and a vendored chart
+        run: |
+          set -euo pipefail
+          mkdir -p sample/helm/kagent/templates sample/contrib/tools/vendored
+          cat > sample/helm/kagent/Chart-template.yaml <<'YML'
+          apiVersion: v2
+          name: kagent
+          type: application
+          version: ${VERSION}
+          YML
+          printf 'replicas: 1\n' > sample/helm/kagent/values.yaml
+          cat > sample/helm/kagent/templates/deployment.yaml <<'YML'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: kagent
+          spec:
+            replicas: {{ .Values.replicas }}
+            template:
+              spec:
+                containers:
+                  - name: app
+                    image: busybox
+          YML
+          cat > sample/contrib/tools/vendored/Chart.yaml <<'YML'
+          apiVersion: v2
+          name: vendored
+          version: 1.2.3
+          YML
+
+      - name: Run run-tool (trivy) over the sample
+        uses: ./.github/actions/run-tool
+        with:
+          tool: trivy
+          source_dir: sample
+          trivy_version: "0.76.2"
+          zizmor_version: "1.32.0"
+          qscan_version: "0.12.0"
+
+      - name: Assert the prep made the templated chart discoverable and left the vendored one alone
+        run: |
+          set -euo pipefail
+          c="sample/helm/kagent/Chart.yaml"
+          [ -s "$c" ] || { echo "::error::prep did not create $c"; exit 1; }
+          if grep -q 'VERSION' "$c"; then echo "::error::placeholder left unsubstituted in $c"; exit 1; fi
+          grep -q '0.0.0' "$c" || { echo "::error::expected dummy version in $c"; exit 1; }
+          grep -q 'version: 1.2.3' sample/contrib/tools/vendored/Chart.yaml \
+            || { echo "::error::vendored Chart.yaml was clobbered"; exit 1; }
+          echo "OK: templated chart got a scan-only Chart.yaml; vendored chart untouched"
+
   # Load run-engine + build-and-post so GitHub VALIDATES their manifests. actionlint and the structural
   # check cannot catch a load-time template error (e.g. ${{ }} in an input's metadata); only GitHub's own
   # manifest load does, and it runs at job prep for every action the job uses. The two action steps are

@@ -14,7 +14,9 @@
 #
 # Composite-action constraints honored here: every step sets `shell: bash`; every value a step reads is
 # set on that step's own `env:` from an input or a runner var ($RUNNER_TEMP / $GITHUB_* -- a composite
-# action does NOT inherit the job's `env:` map). Tool versions are INPUTS the door supplies (never
+# action does NOT inherit the job's `env:` map). Before the Trivy scan, a chart-discovery prep step
+# materializes a scan-only `Chart.yaml` for any build-templated chart (`Chart-template.yaml`) so Trivy
+# can misconfig-scan first-party Helm charts too (#447). Tool versions are INPUTS the door supplies (never
 # hardcoded here, never a workflow_call input the customer controls); the current pinned values are
 # documented on each input. The scan TARGET dir differs by door (private checks out to `.`, opensource
 # clones into `clone/`), so it is the `source_dir` input; trivy-sbom instead reads the engine BOM at
@@ -96,6 +98,32 @@ runs:
       uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
       with:
         node-version: "20"
+
+    # Trivy's Helm misconfig scanner discovers a chart only by a `Chart.yaml` at its root. Charts whose
+    # metadata is templated at build time ship `Chart-template.yaml` and no `Chart.yaml` (kagent's own
+    # helm/kagent + helm/kagent-crds do this), so they are invisible to Trivy and their controller/UI
+    # Deployments are never misconfig-checked, while vendored charts that carry a real `Chart.yaml` are
+    # (#447). This materializes a scan-only `Chart.yaml` beside every `Chart-template.yaml` that lacks one,
+    # with `${...}` build placeholders (e.g. `version: ${VERSION}`) swapped for a valid dummy so the chart
+    # loads. Charts that already have a `Chart.yaml` are untouched. Best-effort: it never fails the job,
+    # and the scan target below is unchanged -- this only widens what Trivy can discover under it.
+    - name: "Trivy: let Helm charts templated as Chart-template.yaml be discovered (#447)"
+      if: ${{ inputs.tool == 'trivy' }}
+      shell: bash
+      continue-on-error: true
+      env:
+        SOURCE_DIR: ${{ inputs.source_dir }}
+      run: |
+        set -uo pipefail
+        n=0
+        while IFS= read -r -d '' tpl; do
+          dir="$(dirname "$tpl")"
+          [ -e "$dir/Chart.yaml" ] && continue
+          if sed 's/\${[A-Za-z_][A-Za-z0-9_]*}/0.0.0/g' "$tpl" > "$dir/Chart.yaml"; then
+            n=$((n + 1))
+          fi
+        done < <(find "$SOURCE_DIR" -type f -name 'Chart-template.yaml' -print0 2>/dev/null)
+        echo "run-tool: materialized $n scan-only Chart.yaml from Chart-template.yaml for Trivy discovery"
 
     - name: "Trivy: scan the tree (fs vuln + misconfig; soft-fail to skipped)"
       if: ${{ inputs.tool == 'trivy' }}
