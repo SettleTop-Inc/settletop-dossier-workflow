@@ -669,7 +669,27 @@ jobs:
               sys.exit(1)
           raw = open("report/share.json", "rb").read()
           if len(raw) > int(os.environ["MAX_BYTES"]):
-              fail("share view is over the size cap (outcome: truncated); not uploaded")
+              # #1098 (spec B5): over the upload cap. Do NOT fail. Emit a tiny stub marker so the repo still
+              # lands a (truncated) code_check and the loop is not stalled; the oversized share — which is
+              # what blew the cap — is never uploaded. Everything here is read from the LOCAL file; only the
+              # marker (outcome + report_sha256 + counts + run_metrics) leaves the runner.
+              env = json.loads(raw)
+              share = env.get("share") or {}
+              def checked_count(name):
+                  sec = share.get(name)
+                  return len(sec["items"]) if isinstance(sec, dict) and sec.get("state") == "checked" else None
+              counts = {k: v for k, v in {"findings": checked_count("rule_findings"),
+                                          "secrets": checked_count("secrets")}.items() if v is not None}
+              marker = {"outcome": "truncated", "report_sha256": share.get("report_sha256"),
+                        "bytes": len(raw), "counts": counts}
+              rm = (env.get("run_meta") or {}).get("run_metrics")
+              if isinstance(rm, dict):
+                  marker["run_metrics"] = rm  # feeds the registry's started_at_ms so it orders as newest (B2)
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("truncated=true\n")
+                  f.write("marker=" + json.dumps(marker, separators=(",", ":"), ensure_ascii=False) + "\n")
+              open(os.environ["RUNNER_TEMP"] + "/truncated.flag", "w").close()  # tells bash to skip the engine validate
+              sys.exit(0)
           if len(raw) != int(os.environ["EXPECT_BYTES"]) or hashlib.sha256(raw).hexdigest() != os.environ["EXPECT_SHA256"]:
               fail("share view does not match the digest or size recorded by scan")
           env = json.loads(raw)
@@ -684,6 +704,12 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"share-sha256={env['share_sha256']}\n")
           PY
+          # Over the cap (spec B5): the marker is already queued on the step output; skip the engine
+          # validate (there is no share to validate) and let the marker-post step take over.
+          if [ -f "$RUNNER_TEMP/truncated.flag" ]; then
+            echo "::warning::share view over the ${MAX_BYTES}-byte cap; posting a truncated marker, not the share (spec B5)."
+            exit 0
+          fi
           # 2. The engine's own check: JSON Schema + SEC re-scan (`validate`), in the same
           #    sandbox, so a secret-shaped string anywhere in the envelope blocks the upload.
           docker pull --quiet "$ENGINE_IMAGE" > /dev/null
@@ -733,6 +759,7 @@ jobs:
       # workflow_call inputs). The validate gate above stays in the door. This job keeps id-token:write.
       - name: Build and post the dossier
         id: post
+        if: steps.validate.outputs.truncated != 'true'
         uses: SettleTop-Inc/settletop-dossier-workflow/.github/actions/build-and-post@0967f7fb084ba19f3c8a7db51b492c62171e388d
         with:
           door: private
@@ -745,6 +772,45 @@ jobs:
           run_started_at: ${{ needs.scan.outputs.run-started-at }}
           max_envelope_bytes: "4194304" # 4 MiB. The whole POST body stays under this.
           idempotency_key: ${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # #1098 (spec B5): the share view blew the upload cap, so post a tiny stub marker instead of the
+      # oversized share. Body is { schema, subject, marker } with NO report; the registry's
+      # ingest_code_check_marker lands a truncated code_check that carries no findings and can never close
+      # one. Same OIDC identity as the share post (this job holds id-token: write). The marker is a few
+      # hundred bytes, so no gzip. This is the one branch that must NOT hard-fail the run on over-cap.
+      - name: Post the over-cap marker
+        if: steps.validate.outputs.truncated == 'true'
+        env:
+          AUDIENCE: ${{ env.INGEST_AUDIENCE }}
+          CALLBACK_URL: https://registry.settletop.com/api/ingest/scan
+          SUBJECT_JSON: ${{ steps.subject.outputs.json }}
+          MARKER_JSON: ${{ steps.validate.outputs.marker }}
+          IDEMPOTENCY_KEY: ${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import json, os
+          e = os.environ
+          body = {"schema": "settletop.dossier-scan/2",
+                  "subject": json.loads(e["SUBJECT_JSON"]),
+                  "marker": json.loads(e["MARKER_JSON"])}
+          with open("marker.json", "w", encoding="utf-8") as f:
+              f.write(json.dumps(body, separators=(",", ":"), ensure_ascii=False))
+          PY
+          # Mint the GitHub identity token for the fixed audience, mask it, then POST the marker.
+          oidc=$(curl -fsS --get --data-urlencode "audience=$AUDIENCE" \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" |
+            python3 -I -c 'import json,sys; print(json.load(sys.stdin)["value"])')
+          echo "::add-mask::$oidc"
+          status=$(printf 'header = "Authorization: Bearer %s"\n' "$oidc" | curl -K - -sS --proto '=https' \
+            --tlsv1.2 --max-time 60 --retry 2 -X POST \
+            -H 'Content-Type: application/json' -H "Idempotency-Key: $IDEMPOTENCY_KEY" \
+            --data-binary @marker.json -o response.json -w '%{http_code}' "$CALLBACK_URL")
+          if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
+            echo "::error::marker ingest returned HTTP $status: $(head -c 500 response.json | tr -d '\r\n')"
+            exit 1
+          fi
+          echo "Posted an over-cap scan marker (outcome: truncated, HTTP $status)." >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
   # cleanup (spec 4.2). actions: write only, granted in the caller to its own token.
